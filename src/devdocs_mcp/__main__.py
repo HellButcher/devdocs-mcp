@@ -173,15 +173,70 @@ def main():
 
 
 def run_mcp_server(args):
-    """Run the MCP server."""
+    """Run the MCP server with proper signal handling."""
+    import asyncio
+    import signal
+    import sys
     from .mcp_server import mcp
     
     logger = logging.getLogger(__name__)
     logger.info("devdocs-mcp starting...")
     logger.info("Config dir: %s", CONFIG_DIR)
     logger.info("Cache dir:  %s", CACHE_DIR)
+    logger.info("Reading from stdin (press CTRL+D to close or CTRL+C to interrupt)")
     
-    mcp.run()
+    # Wrap the FastMCP run to ensure proper signal handling
+    async def run_with_signal_handling():
+        """Run server with proper SIGINT/SIGTERM handling."""
+        # Get the event loop
+        loop = asyncio.get_running_loop()
+        
+        # Create a future to signal shutdown
+        shutdown_future = loop.create_future()
+        
+        def handle_signal():
+            """Handle shutdown signals."""
+            if not shutdown_future.done():
+                logger.info("Shutdown signal received, stopping server...")
+                shutdown_future.set_result(None)
+        
+        # Register signal handlers for clean shutdown
+        loop.add_signal_handler(signal.SIGINT, handle_signal)
+        loop.add_signal_handler(signal.SIGTERM, handle_signal)
+        
+        # Create task for the MCP server
+        server_task = asyncio.create_task(mcp.run_stdio_async())
+        
+        try:
+            # Wait for either the server to finish or shutdown signal
+            done, pending = await asyncio.wait(
+                [server_task, shutdown_future],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # If shutdown was signaled, cancel the server task
+            if shutdown_future in done:
+                server_task.cancel()
+                try:
+                    await server_task
+                except asyncio.CancelledError:
+                    pass
+            
+        finally:
+            # Remove signal handlers
+            loop.remove_signal_handler(signal.SIGINT)
+            loop.remove_signal_handler(signal.SIGTERM)
+    
+    try:
+        # Use asyncio.run which properly handles cancellation in Python 3.11+
+        asyncio.run(run_with_signal_handling())
+        logger.info("Server stopped")
+    except KeyboardInterrupt:
+        # Fallback for when KeyboardInterrupt is raised
+        logger.info("Server stopped")
+    except Exception as e:
+        logger.exception("Server error: %s", e)
+        sys.exit(1)
 
 
 def run_query(args):
