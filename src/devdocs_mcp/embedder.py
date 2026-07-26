@@ -5,13 +5,15 @@ from __future__ import annotations
 import html as html_module
 import json
 import logging
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
-from bs4 import BeautifulSoup
+from lxml import html as lxml_html
+from lxml import etree
 
 from .chunking import chunk_document
 
@@ -34,7 +36,8 @@ def extract_text_from_db(
     db_json: dict[str, Any], 
     slug: str, 
     max_chunk_tokens: int = 512,
-    index_json: dict[str, Any] | None = None
+    index_json: dict[str, Any] | None = None,
+    progress_callback: Optional[Callable] = None
 ) -> list[SearchDocument]:
     """Extract searchable documents from a db.json content map.
 
@@ -46,10 +49,11 @@ def extract_text_from_db(
         slug: Documentation slug
         max_chunk_tokens: Maximum tokens per document chunk
         index_json: Optional index.json with entry metadata
+        progress_callback: Optional callback(current, total, slug) for progress reporting
     """
     # Use entry-based extraction if index available
     if index_json and "entries" in index_json:
-        return _extract_entries_from_index(db_json, index_json, slug, max_chunk_tokens)
+        return _extract_entries_from_index(db_json, index_json, slug, max_chunk_tokens, progress_callback)
     
     # Fallback to page-based extraction
     return _extract_pages_from_db(db_json, slug, max_chunk_tokens)
@@ -70,12 +74,15 @@ def _extract_pages_from_db(db_json: dict[str, Any], slug: str, max_chunk_tokens:
     docs: list[SearchDocument] = []
 
     for path, raw_html in db_json.items():
-        text = _clean_html(raw_html)
+        # Parse once with lxml.html (much faster than BeautifulSoup)
+        tree = lxml_html.fromstring(raw_html)
+        
+        # Extract text and title from the same tree
+        text = _clean_html(tree)
         if not text.strip():
             continue
 
-        # Extract title from HTML
-        title = _extract_title(raw_html, slug)
+        title = _extract_title(tree, slug)
 
         # Chunk large documents
         chunks = chunk_document(text, max_tokens=max_chunk_tokens)
@@ -100,7 +107,8 @@ def _extract_entries_from_index(
     db_json: dict[str, Any],
     index_json: dict[str, Any],
     slug: str,
-    max_chunk_tokens: int = 512
+    max_chunk_tokens: int = 512,
+    progress_callback: Optional[Callable] = None
 ) -> list[SearchDocument]:
     """Extract individual entries using index.json metadata.
     
@@ -112,6 +120,7 @@ def _extract_entries_from_index(
         index_json: Index with entries array
         slug: Documentation slug
         max_chunk_tokens: Maximum tokens per document chunk
+        progress_callback: Optional callback(current, total, slug) for progress reporting
     """
     docs: list[SearchDocument] = []
     entries = index_json.get("entries", [])
@@ -119,7 +128,7 @@ def _extract_entries_from_index(
     # Pre-parse all pages to avoid re-parsing for each entry (MAJOR OPTIMIZATION)
     parsed_pages = {}
     for page_path, page_html in db_json.items():
-        parsed_pages[page_path] = BeautifulSoup(page_html, 'html.parser')
+        parsed_pages[page_path] = lxml_html.fromstring(page_html)
     
     logger.info("Processing %d entries from %s...", len(entries), slug)
     
@@ -141,19 +150,22 @@ def _extract_entries_from_index(
             anchor = path.split("#")[1] if "#" in path else None
             
             # Get pre-parsed page
-            soup = parsed_pages.get(page_path)
-            if not soup:
+            page_tree = parsed_pages.get(page_path)
+            if page_tree is None:
                 logger.debug("Page not found for entry %s: %s", name, page_path)
                 continue
             
-            # Extract section for this entry
+            # Extract section for this entry (returns lxml element)
             if anchor:
-                entry_html = _extract_section_by_anchor_from_soup(soup, anchor)
+                entry_tree = _extract_section_by_anchor_from_tree(page_tree, anchor)
+                if entry_tree is None:
+                    logger.debug("Anchor not found for entry %s: %s", name, anchor)
+                    continue
             else:
-                entry_html = str(soup)
+                entry_tree = page_tree
             
-            # Clean and chunk
-            text = _clean_html(entry_html)
+            # Clean and chunk (no re-parsing needed)
+            text = _clean_html(entry_tree)
             if not text.strip():
                 continue
             
@@ -173,206 +185,211 @@ def _extract_entries_from_index(
                     source_type="devdocs",
                 ))
         
-        # Log progress every batch
+        # Log progress every batch and call progress callback
+        processed = batch_idx + len(batch)
+        if progress_callback:
+            progress_callback(processed, len(entries), slug)
+        
         if batch_idx + batch_size < len(entries):
-            logger.info("Processed %d/%d entries...", batch_idx + len(batch), len(entries))
+            logger.info("Processed %d/%d entries...", processed, len(entries))
     
     logger.info("Extracted %d documents from %s (%d entries in index.json)", len(docs), slug, len(entries))
     return docs
 
 
-def _extract_section_by_anchor_from_soup(soup: Any, anchor: str) -> str:
-    """Extract HTML section for a specific anchor ID from pre-parsed soup.
+def _extract_section_by_anchor_from_tree(tree: Any, anchor: str) -> Any:
+    """Extract lxml element section for a specific anchor ID from pre-parsed tree.
     
     Finds the element with the matching ID and collects content
     until the next heading of the same or higher level.
     
     Args:
-        soup: Pre-parsed BeautifulSoup object
+        tree: Pre-parsed lxml element tree
         anchor: Anchor ID to search for
         
     Returns:
-        HTML section for the anchor, or empty string if anchor not found
+        lxml element containing the section, or None if anchor not found
     """
-    # Try finding with and without leading underscore
-    element = soup.find(id=anchor)
-    if not element and anchor.startswith('_'):
-        element = soup.find(id=anchor[1:])
-    elif not element and not anchor.startswith('_'):
-        element = soup.find(id=f'_{anchor}')
+    # Try finding with and without leading underscore using XPath
+    element = tree.get_element_by_id(anchor, None)
+    if element is None and anchor.startswith('_'):
+        element = tree.get_element_by_id(anchor[1:], None)
+    elif element is None and not anchor.startswith('_'):
+        element = tree.get_element_by_id(f'_{anchor}', None)
     
-    if not element:
-        return ""
+    if element is None:
+        return None
     
-    # Collect content from this element until the next same-level heading
-    section_parts = []
-    current = element
-    
-    # Determine the heading level to stop at
-    heading_levels = {'h1': 1, 'h2': 2, 'h3': 3, 'h4': 4, 'h5': 5, 'h6': 6}
-    stop_level = None
-    
-    # If element is a heading, stop at same level
-    if element.name in heading_levels:
-        stop_level = heading_levels[element.name]
-    # Otherwise stop at h2 or higher
-    else:
-        stop_level = 2
-    
-    while current:
-        section_parts.append(str(current))
-        current = current.find_next_sibling()
-        
-        # Stop at next heading of same or higher level
-        if current and current.name in heading_levels:
-            if heading_levels[current.name] <= stop_level:
-                break
-    
-    return ''.join(section_parts)
+    # For simplicity, just return the element itself
+    # lxml will extract text from it and all descendants
+    return element
 
-
-def _extract_title(html: str, default: str) -> str:
-    """Extract title from HTML."""
-    soup = BeautifulSoup(html, 'html.parser')
+def _extract_title(tree: Any, default: str) -> str:
+    """Extract title from HTML.
     
+    Args:
+        tree: lxml element tree
+        default: Default title if extraction fails
+    """
     # Try h1 first
-    h1 = soup.find('h1')
-    if h1:
-        return h1.get_text(strip=True)
+    h1_elements = tree.xpath('.//h1')
+    if h1_elements:
+        return h1_elements[0].text_content().strip()
     
     # Try title tag
-    title_tag = soup.find('title')
-    if title_tag:
-        return title_tag.get_text(strip=True)
+    title_elements = tree.xpath('.//title')
+    if title_elements:
+        return title_elements[0].text_content().strip()
     
     # Fallback to default
     return default.replace("_", " ").title()
 
 
-def extract_text_from_local(docs_dir: Path, slug: str) -> list[SearchDocument]:
-    """Extract documents from a local HTML directory."""
-    local_dir = docs_dir / "local" / slug
-    if not local_dir.exists():
-        return []
+def scan_local_directory(base_path: Path) -> list[Path]:
+    """Scan a local directory for HTM/HTML files to index."""
+    html_files: list[Path] = []
+    for root, dirs, files in os.walk(base_path):
+        for file in files:
+            if file.lower().endswith(('.htm', '.html')):
+                html_files.append(Path(root) / file)
+        for dir in dirs:
+            if dir.startswith('.') or "node_modules" in dir or "__pycache__" in dir:
+                dirs.remove(dir)  # Skip hidden directories
+    return html_files
 
+def extract_text_from_local(
+    f: Path, 
+    slug: str, 
+    source_type: str,
+    max_chunk_tokens: int = 512
+) -> list[SearchDocument]:
+    """Extract documents from a local HTML file with chunking.
+    
+    Args:
+        f: Path to HTML file
+        slug: Documentation slug
+        source_type: Source type identifier (e.g., "local", "web")
+        max_chunk_tokens: Maximum tokens per chunk (default: 512)
+        
+    Returns:
+        List of SearchDocument chunks with extracted titles
+    """
+    import sys
     docs: list[SearchDocument] = []
-    for f in sorted(local_dir.glob("*.html")):
-        text = _clean_html(f.read_text())
-        if not text.strip():
-            continue
-
-        title = f.stem.replace("_", " ").title()
+    
+    # Log file size for large files
+    file_size_mb = f.stat().st_size / (1024 * 1024)
+    if file_size_mb > 5:
+        logger.info("  Reading %s (%.1f MB)...", f.name, file_size_mb)
+        sys.stderr.flush()
+    
+    # Read HTML content
+    html_content = f.read_text(encoding='utf-8')
+    
+    if file_size_mb > 5:
+        logger.info("  Parsing HTML with lxml (fast)...")
+        sys.stderr.flush()
+    
+    # Parse HTML once with lxml (much faster than BeautifulSoup)
+    tree = lxml_html.fromstring(html_content)
+    
+    # Extract title from parsed tree
+    title = _extract_title(tree, default=f.stem)
+    
+    # Clean HTML to get text (reuses the same tree object)
+    text = _clean_html(tree)
+    
+    if not text.strip():
+        return []
+    
+    if file_size_mb > 5:
+        logger.info("  Chunking document...")
+        sys.stderr.flush()
+    
+    # Chunk large documents
+    chunks = chunk_document(text, max_tokens=max_chunk_tokens)
+    
+    if file_size_mb > 5:
+        logger.info("  Created %d chunks", len(chunks))
+        sys.stderr.flush()
+    
+    for i, chunk_text in enumerate(chunks):
+        # Generate unique ID for each chunk
+        doc_id_suffix = f"#{i}" if len(chunks) > 1 else ""
+        doc_id = f"{source_type}/{slug}/{f.stem}{doc_id_suffix}"
+        
+        # Add part number to title if multiple chunks
+        chunk_title = f"{title} (part {i+1}/{len(chunks)})" if len(chunks) > 1 else title
+        
         docs.append(SearchDocument(
-            id=f"local/{slug}/{f.stem}",
+            id=doc_id,
             slug=slug,
-            title=title,
-            content=text.strip(),
-            source_type="local",
+            title=chunk_title,
+            content=chunk_text.strip(),
+            source_type=source_type,
         ))
-
+    
     return docs
 
 
-def _filter_nested_elements(elements: list) -> list:
-    """Filter out elements that are nested inside other elements in the list.
-    
-    Args:
-        elements: List of BeautifulSoup elements
-        
-    Returns:
-        List of only top-level (non-nested) elements
-        
-    Example:
-        If element A contains element B, only A is returned.
-    """
-    if not elements:
-        return []
-    
-    top_level = []
-    for element in elements:
-        # Check if this element is nested inside any other element in the list
-        is_nested = any(
-            element in other.descendants 
-            for other in elements 
-            if other != element
-        )
-        if not is_nested:
-            top_level.append(element)
-    
-    return top_level
-
-
-def _clean_html(raw: str) -> str:
+def _clean_html(tree: Any) -> str:
     """Strip HTML tags and extract plain text from documentation pages.
     
-    Uses BeautifulSoup for robust HTML parsing. Prioritizes <main> content
+    Uses lxml for fast HTML parsing. Prioritizes <main> content
     if available to exclude navigation, headers, footers, and sidebars.
-    Handles multiple main containers without nesting duplicates.
+    
+    Args:
+        tree: lxml element tree
     """
-    soup = BeautifulSoup(raw, 'html.parser')
+    # First, find the content container (before removing anything)
+    content_element = None
     
-    # Prioritize <main> tag content if present (semantic HTML for main content)
-    main_tags = soup.find_all('main')
-    
-    if main_tags:
-        top_level_mains = _filter_nested_elements(main_tags)
-        
-        if top_level_mains:
-            logger.debug(
-                "Found %d top-level <main> tag(s), extracting main content only", 
-                len(top_level_mains)
-            )
-            # Create a new soup with only the main content containers
-            combined_soup = BeautifulSoup('<div></div>', 'html.parser')
-            container = combined_soup.div
-            for main in top_level_mains:
-                container.append(main)
-            soup = container
+    # Prioritize <main> tag content if present
+    main_elements = tree.xpath('.//main')
+    if main_elements:
+        content_element = main_elements[0]
     else:
-        # If no <main>, look for common content containers
-        # Try to find ALL matching containers of the same type
-        for selector_func in [
-            lambda s: s.find_all('article'),
-            lambda s: s.find_all(class_='content'),
-            lambda s: s.find_all(id='content'),
-            lambda s: s.find_all(class_='main-content'),
-            lambda s: s.find_all(class_='documentation'),
-            lambda s: s.find_all(role='main'),
+        # Try common content containers
+        for xpath in [
+            './/article',
+            './/*[@id="content"]',
+            './/*[contains(@class, "content")]',
+            './/*[contains(@class, "main-content")]',
+            './/*[contains(@class, "documentation")]',
+            './/*[@role="main"]',
         ]:
-            containers = selector_func(soup)
+            containers = tree.xpath(xpath)
             if containers:
-                top_level = _filter_nested_elements(containers)
-                
-                if top_level:
-                    logger.debug(
-                        "Found %d content container(s): %s", 
-                        len(top_level), 
-                        top_level[0].name if top_level else "none"
-                    )
-                    # Create combined soup
-                    combined_soup = BeautifulSoup('<div></div>', 'html.parser')
-                    wrapper = combined_soup.div
-                    for cont in top_level:
-                        wrapper.append(cont)
-                    soup = wrapper
-                    break
+                content_element = containers[0]
+                break
     
+    # If no content container found, use the whole tree
+    if content_element is None:
+        content_element = tree
+    
+    # Now remove noise elements from the content element
     # Remove script, style, and navigation elements
-    for element in soup.find_all(['script', 'style', 'nav', 'header', 'footer', 'aside']):
-        element.decompose()
+    for tag in ['script', 'style', 'nav', 'header', 'footer', 'aside']:
+        for element in content_element.xpath(f'.//{tag}'):
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
     
-    # Remove common noise classes
+    # Remove common noise classes using XPath
     noise_classes = [
         'sidebar', 'navigation', 'nav', 'breadcrumb', 'breadcrumbs',
         'toc', 'table-of-contents', 'menu', 'ad', 'advertisement',
         'social', 'share', 'comments', 'related', 'suggested'
     ]
     for noise_class in noise_classes:
-        for element in soup.find_all(class_=lambda c: c and noise_class in c.lower()):
-            element.decompose()
+        xpath = f'.//*[contains(concat(" ", normalize-space(@class), " "), " {noise_class} ")]'
+        for element in content_element.xpath(xpath):
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
     
-    # Get text with some structure preservation
-    text = soup.get_text(separator='\n', strip=True)
+    # Extract text
+    text = content_element.text_content()
     
     # Normalize whitespace
     lines = [line.strip() for line in text.splitlines()]
@@ -383,8 +400,8 @@ def _clean_html(raw: str) -> str:
 
 def _strip_tags(html_str: str) -> str:
     """Remove all HTML tags from a string."""
-    soup = BeautifulSoup(html_str, 'html.parser')
-    return soup.get_text(strip=True)
+    tree = lxml_html.fromstring(html_str)
+    return tree.text_content()
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,36 @@ def main():
         help="Slug prefix for generated entries",
     )
     
+    # Add -> web
+    web_parser = add_subparsers.add_parser(
+        "web",
+        help="Fetch documentation from a web URL (or re-download by slug)",
+    )
+    web_parser.add_argument(
+        "slug",
+        help="Unique identifier for this web source",
+    )
+    web_parser.add_argument(
+        "url",
+        nargs="?",
+        help="Base URL to fetch from (optional for re-download)",
+    )
+    web_parser.add_argument(
+        "--name",
+        help="Display name (defaults to slug)",
+    )
+    web_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=2,
+        help="Recursion depth for crawling (default: 2)",
+    )
+    web_parser.add_argument(
+        "--pattern",
+        default=r".*\.html?$",
+        help=r"Regex pattern for URLs to fetch (default: .*\.html?$)",
+    )
+    
     # Reindex command
     reindex_parser = subparsers.add_parser(
         "reindex",
@@ -135,6 +165,16 @@ def main():
         help="Fuzzy filter on doc metadata (slug, name, type, etc.)",
     )
     
+    # Info command
+    info_parser = subparsers.add_parser(
+        "info",
+        help="Show detailed information about a specific documentation",
+    )
+    info_parser.add_argument(
+        "slug",
+        help="Documentation slug (e.g., javascript, python)",
+    )
+    
     args = parser.parse_args()
     
     # Set up logging
@@ -160,6 +200,8 @@ def main():
             run_reindex(args)
         elif args.command == "list":
             run_list(args)
+        elif args.command == "info":
+            run_info(args)
         else:
             parser.print_help()
             sys.exit(1)
@@ -242,9 +284,8 @@ def run_mcp_server(args):
 def run_query(args):
     """Run a search query from the command line."""
     from .config import get_config
-    from .faiss_index import EmbeddingIndex, _ML_DEPS_OK
-    from .embedder import get_document_by_id
-    import sqlite3
+    from .faiss_index import _ML_DEPS_OK
+    from .operations import search_docs_impl
     
     logger = logging.getLogger(__name__)
     
@@ -255,49 +296,33 @@ def run_query(args):
     
     config = get_config()
     
-    # Check if index exists
-    if not (config.cache_dir / "embeddings" / "index.faiss").exists():
-        logger.error("No search index found.")
-        logger.error("Run 'devdocs-mcp reindex' to create the index first.")
+    # Use shared implementation
+    result = search_docs_impl(
+        config,
+        query=args.search_query,
+        top_k=args.top_k,
+        min_score=args.min_score,
+        slugs=args.slugs if args.slugs else None,
+        source_type=args.source if hasattr(args, 'source') else None,
+    )
+    
+    # Format for CLI (nice user-friendly output)
+    if not result.success:
+        if "No embeddings found" in (result.error or ""):
+            logger.error("No search index found.")
+            logger.error("Run 'devdocs-mcp reindex' to create the index first.")
+        else:
+            logger.error(result.error or "Search failed.")
         sys.exit(1)
     
-    # Load index
-    idx = EmbeddingIndex(config.embeddings_dir, config.metadata_db_path)
-    idx.load_or_create_index()
-    
-    # Search
-    results = idx.search(args.search_query, top_k=args.top_k * 3, min_score=args.min_score)
-    
-    logger = logging.getLogger(__name__)
-    
-    if not results:
+    if not result.results:
         logger.info("No results found for: %s", args.search_query)
         sys.exit(0)
     
-    # Filter results if needed
-    filtered_results = []
-    with sqlite3.connect(str(config.metadata_db_path)) as db:
-        for r in results:
-            doc = get_document_by_id(db, r["doc_id"])
-            if not doc:
-                continue
-            
-            # Apply filters
-            if args.slugs and doc.get("slug") not in args.slugs:
-                continue
-            if args.source and doc.get("source_type") != args.source:
-                continue
-            
-            filtered_results.append({**r, **doc})
-            
-            if len(filtered_results) >= args.top_k:
-                break
-    
     # Display results
-    logger = logging.getLogger(__name__)
-    logger.info("Found %d results for: %s\n", len(filtered_results), args.search_query)
+    logger.info("Found %d results for: %s\n", len(result.results), args.search_query)
     
-    for i, r in enumerate(filtered_results, 1):
+    for i, r in enumerate(result.results, 1):
         logger.info("%d. [%s] (%s) - Score: %.3f", i, r['title'], r['slug'], r['score'])
         if r.get('path'):
             logger.info("   Path: %s", r['path'])
@@ -306,72 +331,88 @@ def run_query(args):
 
 
 def run_add(args):
-    """Add documentation (download or local)."""
+    """Add documentation (download, local, or web)."""
     from .config import get_config
-    from .catalog import fetch_devdocs_catalog, find_doc_by_slug, index_local_directory
-    from .download import download_doc as download_doc_impl
-    from .mcp_server import add_local_source
-    from .config import LocalSource
+    from .operations import download_docs_impl, add_local_source_impl, add_web_source_impl
     
     logger = logging.getLogger(__name__)
     config = get_config()
     
     if not args.add_type:
-        logger.error("Specify what to add: 'download' or 'local'")
+        logger.error("Specify what to add: 'download', 'local', or 'web'")
         sys.exit(1)
     
     if args.add_type == "download":
-        catalog = fetch_devdocs_catalog(cache_dir=config.cache_dir)
+        # Use shared implementation
+        result = download_docs_impl(config, args.slugs)
         
-        for slug in args.slugs:
-            doc_entry = find_doc_by_slug(catalog, slug)
-            if not doc_entry:
-                logger.error("Documentation '%s' not found in catalog", slug)
-                continue
-            
-            try:
-                logger.info("Downloading %s...", slug)
-                download_doc_impl(slug, config.docs_dir)
-                config.downloaded_slugs.add(slug)
-                logger.info("✓ Downloaded %s (%.1f MB)", slug, doc_entry.size_mb)
-            except Exception as e:
-                logger.error("✗ Failed to download %s: %s", slug, e)
+        # Format for CLI
+        for slug in result.successful_slugs:
+            logger.info("✓ Downloaded %s", slug)
         
-        config.save()
-        logger.info("Downloaded %d docs.", len(args.slugs))
-        logger.info("Run 'devdocs-mcp reindex' to make them searchable.")
+        for slug in result.failed_slugs:
+            logger.error("✗ Failed to download %s: %s", slug, result.errors.get(slug, "Unknown error"))
+        
+        if result.successful_slugs:
+            logger.info("")
+            total_size_mb = result.metadata.get("total_size_mb", 0.0)
+            logger.info("Downloaded %d doc(s) (%.1f MB total)", len(result.successful_slugs), total_size_mb)
+            logger.info("Run 'devdocs-mcp reindex' to make them searchable.")
+        
+        if result.failed_slugs and not result.successful_slugs:
+            sys.exit(1)
         
     elif args.add_type == "local":
-        from pathlib import Path
+        # Use shared implementation
+        result = add_local_source_impl(config, args.path, args.prefix or "")
         
-        path = Path(args.path).expanduser().resolve()
-        
-        if not path.exists() or not path.is_dir():
-            logger.error("Path '%s' does not exist or is not a directory", path)
+        # Format for CLI
+        if not result.success:
+            error_msg = list(result.errors.values())[0] if result.errors else "Failed to add local source"
+            logger.error(error_msg)
             sys.exit(1)
         
-        html_files = list(path.glob("*.html")) + list(path.glob("*.htm"))
-        if not html_files:
-            logger.error("No HTML files found in '%s'", path)
-            sys.exit(1)
-        
-        source = LocalSource(path=str(path), slug_prefix=args.prefix)
-        config.sources.append(source)
-        config.save()
-        
+        path = result.metadata.get("path", args.path)
+        num_files = result.metadata.get("num_files", len(result.successful_slugs))
         logger.info("✓ Added local source: %s", path)
-        logger.info("  Found %d HTML files", len(html_files))
+        logger.info("  Found %d HTML files", num_files)
+        logger.info("Run 'devdocs-mcp reindex' to index them.")
+    
+    elif args.add_type == "web":
+        # Use shared implementation
+        result = add_web_source_impl(
+            config,
+            args.url,  # May be None for re-download
+            args.slug,
+            name=args.name,
+            max_depth=args.max_depth,
+            pattern=args.pattern,
+        )
+        
+        # Format for CLI
+        if not result.success:
+            error_msg = list(result.errors.values())[0] if result.errors else "Failed to fetch web source"
+            logger.error(error_msg)
+            sys.exit(1)
+        
+        url = result.metadata.get("url", args.url or "existing source")
+        num_files = result.metadata.get("num_files", len(result.successful_slugs))
+        
+        if args.url:
+            logger.info("✓ Fetched web source: %s", url)
+        else:
+            logger.info("✓ Re-downloaded web source: %s", url)
+        
+        logger.info("  Downloaded %d HTML files", num_files)
         logger.info("Run 'devdocs-mcp reindex' to index them.")
 
 
 def run_reindex(args):
     """Rebuild the search index."""
     from .config import get_config
-    from .embedder import init_metadata_db, upsert_documents, extract_text_from_db
-    from .download import get_doc_pages, get_doc_index, list_downloaded_docs
-    from .faiss_index import EmbeddingIndex, _ML_DEPS_OK
-    from .config import LocalSource
-    from pathlib import Path
+    from .faiss_index import _ML_DEPS_OK
+    from .operations import rebuild_index_impl
+    import sys
     
     logger = logging.getLogger(__name__)
     
@@ -382,294 +423,222 @@ def run_reindex(args):
     
     config = get_config()
     
-    # Clean mode: drop and recreate database
-    if args.clean:
-        logger.info("Cleaning existing database...")
-        if config.metadata_db_path.exists():
-            config.metadata_db_path.unlink()
-            logger.info("✓ Dropped old database")
-        if config.faiss_index_path.exists():
-            config.faiss_index_path.unlink()
-            logger.info("✓ Dropped old FAISS index")
-        logger.info("")
+    # Progress tracking state
+    progress_state = {
+        "current_slug": None,
+        "current": 0,
+        "total": 0,
+        "last_percent": -1,
+    }
     
-    # Initialize database
-    logger.info("Initializing metadata database...")
-    db = init_metadata_db(config.metadata_db_path)
-    logger.info("✓ Database ready")
-    logger.info("")
+    def progress_callback(current: int, total: int, slug: str):
+        """Display progress bar for document extraction."""
+        # Update state
+        if progress_state["current_slug"] != slug:
+            progress_state["current_slug"] = slug
+            progress_state["current"] = 0
+            progress_state["total"] = total
+            progress_state["last_percent"] = -1
+        
+        progress_state["current"] = current
+        progress_state["total"] = total
+        
+        # Calculate percentage
+        percent = int((current / total) * 100) if total > 0 else 0
+        
+        # Only update if percentage changed (avoid spamming)
+        if percent != progress_state["last_percent"]:
+            progress_state["last_percent"] = percent
+            
+            # Draw progress bar
+            bar_width = 40
+            filled = int(bar_width * current / total) if total > 0 else 0
+            bar = "=" * filled + "-" * (bar_width - filled)
+            
+            # Print with carriage return to overwrite
+            sys.stderr.write(f"\r  Extracting {slug}: [{bar}] {current}/{total} ({percent}%)")
+            sys.stderr.flush()
+            
+            # Newline when complete
+            if current >= total:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
     
-    # Initialize FAISS index
-    logger.info("Loading embedding model...")
-    idx = EmbeddingIndex(config.embeddings_dir, config.metadata_db_path)
-    idx.load_or_create_index()
-    logger.info("✓ Index ready")
-    logger.info("")
+    # Use shared implementation with progress callback
+    result = rebuild_index_impl(
+        config,
+        clean=args.clean,
+        slugs=args.slugs if args.slugs else None,
+        progress_callback=progress_callback,
+    )
     
-    # Process downloaded docs
-    total_docs = 0
-    total_embeddings = 0
-    downloaded = list_downloaded_docs(config.docs_dir)
-    
-    # If specific slugs requested, filter to only those
-    if args.slugs:
-        # Validate that requested slugs are downloaded
-        not_downloaded = [s for s in args.slugs if s not in downloaded]
-        if not_downloaded:
-            logger.error("The following docs are not downloaded: %s", ', '.join(not_downloaded))
-            logger.error("Download them first with: devdocs-mcp add download <slug>")
-            logger.error("")
-            logger.info("Available docs: %s", ', '.join(sorted(downloaded)))
-            sys.exit(1)
-        
-        slugs_to_index = args.slugs
-        logger.info("Re-indexing specific docs: %s", ', '.join(slugs_to_index))
-        logger.info("")
-        
-        # Delete existing entries for these slugs
-        from .embedder import get_documents_by_slug
-        for slug in slugs_to_index:
-            existing_docs = get_documents_by_slug(db, slug)
-            if existing_docs:
-                doc_ids_to_delete = [doc['id'] for doc in existing_docs]
-                logger.info("Removing %d existing documents for %s", len(doc_ids_to_delete), slug)
-                
-                # Remove from FAISS index and database
-                idx.remove_documents(doc_ids_to_delete)
-        
-        if any(get_documents_by_slug(db, s) for s in slugs_to_index):
-            logger.info("")
-    else:
-        # Get already-indexed slugs (unless --clean was used)
-        from .embedder import get_documents_by_slug
-        indexed_slugs = set()
-        if not args.clean:
-            for slug in downloaded:
-                existing_docs = get_documents_by_slug(db, slug)
-                if existing_docs:
-                    indexed_slugs.add(slug)
-        
-        # Filter to only missing slugs (unless --clean)
-        slugs_to_index = [s for s in downloaded if s not in indexed_slugs]
-        
-        if not slugs_to_index:
-            logger.info("All downloaded documentation is already indexed.")
+    # Format result for CLI (nice user-friendly output)
+    if not result.success:
+        if result.error and "already indexed" in result.error:
+            logger.info(result.error)
             logger.info("Use --clean to rebuild from scratch.")
             logger.info("Use --slugs to re-index specific docs.")
             logger.info("")
             return
-        
-        if indexed_slugs:
-            logger.info("Skipping %d already-indexed docs (use --clean to rebuild all)", len(indexed_slugs))
-    
-    logger.info("Processing %d documentation bundle(s)...", len(slugs_to_index))
-    logger.info("")
-    
-    for i, slug in enumerate(slugs_to_index, 1):
-        logger.info("[%d/%d] %s...", i, len(slugs_to_index), slug)
-        
-        db_pages = get_doc_pages(slug, config.docs_dir)
-        if not db_pages:
-            logger.info("(no pages)")
-            continue
-        
-        # Get index.json for entry-level extraction
-        index_data = get_doc_index(slug, config.docs_dir)
-        
-        docs = extract_text_from_db(db_pages, slug, index_json=index_data)
-        if not docs:
-            logger.info("(no content)")
-            continue
-        
-        # Insert into database first (to get auto-generated IDs)
-        count = upsert_documents(db, docs)
-        total_docs += count
-        
-        # Re-read documents to get the auto-generated IDs
-        stored_docs = get_documents_by_slug(db, slug)
-        
-        # Add to FAISS index using stored IDs
-        if stored_docs:
-            faiss_ids = [d["faiss_id"] for d in stored_docs]  # Use faiss_id column (INTEGER id)
-            texts = [d["content"] for d in stored_docs]
-            
-            # Directly encode and add to FAISS
-            import numpy as np
-            if texts:
-                embeddings = idx.model.encode(texts, normalize_embeddings=True)
-                idx.faiss_index.add_with_ids(
-                    embeddings.astype("float32"),
-                    np.array(faiss_ids, dtype=np.int64)
-                )
-                total_embeddings += len(texts)
-                emb_count = len(texts)
-            else:
-                emb_count = 0
         else:
-            emb_count = 0
-        
-        # Show entry count if available
-        if index_data and 'entries' in index_data:
-            entry_count = len(index_data['entries'])
-            logger.info("(%d docs from %d entries, %d embeddings)", count, entry_count, emb_count)
-        else:
-            logger.info("(%d docs, %d embeddings)", count, emb_count)
+            logger.error(result.error or "Index operation failed.")
+            if "not available" in (result.error or ""):
+                logger.error("Download them first with: devdocs-mcp add download <slug>")
+                logger.error("")
+                logger.info("Total available docs: %d", result.total_available)
+            sys.exit(1)
     
-    # Save index
-    logger.info("")
-    logger.info("Saving FAISS index...")
-    idx.save_index()
+    # Show success output
     logger.info("✓ Index saved")
     logger.info("")
     
     logger.info("=" * 60)
-    if args.slugs:
-        logger.info("Re-index Complete for: %s", ', '.join(args.slugs))
+    if result.mode == "specific":
+        logger.info("Re-index Complete for: %s", ', '.join(result.slugs_processed))
     else:
         logger.info("Reindex Complete!")
     logger.info("=" * 60)
-    logger.info("Documents indexed: %d", total_docs)
-    logger.info("Embeddings created: %d", total_embeddings)
-    if args.slugs:
-        logger.info("Docs re-indexed: %d", len(slugs_to_index))
+    logger.info("Documents indexed: %d", result.total_docs)
+    logger.info("Embeddings created: %d", result.total_embeddings)
+    if result.mode == "specific":
+        logger.info("Docs re-indexed: %d", len(result.slugs_processed))
     else:
-        logger.info("Total docs in index: %d", len(downloaded))
-        logger.info("New docs added: %d", len(slugs_to_index))
+        logger.info("Total available docs: %d (%d devdocs, %d local)", 
+                   result.total_available, result.devdocs_count, result.local_count)
+        logger.info("New docs added: %d", result.new_docs_added)
     logger.info("")
 
 
 def run_list(args):
     """List available or downloaded documentation."""
     from .config import get_config
-    from .catalog import get_merged_catalog
-    from .download import list_downloaded_docs
-    from .embedder import get_documents_by_slug
-    import sqlite3
+    from .operations import list_docs_impl
     
     logger = logging.getLogger(__name__)
     config = get_config()
     
-    # Check index status
-    index_exists = (config.cache_dir / "embeddings" / "index.faiss").exists()
-    indexed_slugs = set()
-    
-    if index_exists:
-        try:
-            with sqlite3.connect(str(config.metadata_db_path)) as db:
-                catalog = get_merged_catalog(config)
-                for entry in catalog:
-                    if entry.slug in config.downloaded_slugs:
-                        docs = get_documents_by_slug(db, entry.slug)
-                        if docs:
-                            indexed_slugs.add(entry.slug)
-        except Exception as e:
-            logger.warning("Failed to check index status: %s", e)
-    
     if args.downloaded:
-        # List only downloaded docs
-        downloaded = list_downloaded_docs(config.docs_dir)
-        catalog = get_merged_catalog(config)
+        # List only downloaded/available docs (CLI default behavior different from MCP)
+        result = list_docs_impl(
+            config,
+            source_type=None,
+            include_large=args.large,
+            downloaded_only=True,
+            query=args.query if args.query else None,
+        )
         
-        # Apply query filter if provided
-        if args.query:
-            query_lower = args.query.lower()
-            filtered = []
-            for slug in sorted(downloaded.keys()):
-                entry = next((e for e in catalog if e.slug == slug), None)
-                if entry:
-                    searchable = [
-                        entry.slug,
-                        entry.name,
-                        entry.type,
-                        entry.release or "",
-                        entry.alias or "",
-                    ]
-                    if any(query_lower in field.lower() for field in searchable):
-                        filtered.append((slug, entry))
-                else:
-                    # No catalog entry, just check slug
-                    if query_lower in slug.lower():
-                        filtered.append((slug, None))
-        else:
-            filtered = [(slug, next((e for e in catalog if e.slug == slug), None)) 
-                       for slug in sorted(downloaded.keys())]
-        
-        # Build header
-        header_parts = [f"Downloaded documentation ({len(filtered)})"]
-        if not index_exists:
+        # Build CLI-specific output
+        header_parts = [f"Downloaded documentation ({result.total_count})"]
+        if not result.index_exists:
             header_parts.append("[INDEX NOT BUILT]")
-        elif indexed_slugs:
-            indexed_count = len([s for s, _ in filtered if s in indexed_slugs])
-            if indexed_count < len(filtered):
-                header_parts.append(f"[{indexed_count}/{len(filtered)} indexed]")
+        elif result.indexed_slugs:
+            indexed_count = len([e for e, _ in result.entries if e.slug in result.indexed_slugs])
+            if indexed_count < result.total_count:
+                header_parts.append(f"[{indexed_count}/{result.total_count} indexed]")
         if args.query:
             header_parts.append(f"(matching '{args.query}')")
         
         logger.info(" ".join(header_parts) + ":\n")
         
-        for slug, entry in filtered:
-            size_str = f" ({entry.size_mb:.1f} MB)" if entry else ""
-            indexed_marker = " [indexed]" if slug in indexed_slugs else " [NOT indexed]" if index_exists else ""
-            logger.info("  %s%s%s", slug, indexed_marker, size_str)
+        for entry, _ in result.entries:
+            indexed_marker = " [indexed]" if entry.slug in result.indexed_slugs else " [NOT indexed]" if result.index_exists else ""
+            logger.info("  %s%s (%.1f MB)", entry.slug, indexed_marker, entry.size_mb)
         
         # Show helpful tips
-        if not index_exists and filtered:
+        if not result.index_exists and result.entries:
             logger.info("\nRun 'devdocs-mcp reindex' to create the search index.")
-        elif indexed_slugs and any(s not in indexed_slugs for s, _ in filtered):
-            unindexed = [s for s, _ in filtered if s not in indexed_slugs]
+        elif result.indexed_slugs and any(e.slug not in result.indexed_slugs for e, _ in result.entries):
+            unindexed = [e.slug for e, _ in result.entries if e.slug not in result.indexed_slugs]
             logger.info("\nUnindexed docs: %s", ', '.join(unindexed))
             logger.info("Run 'devdocs-mcp reindex' to index them.")
     else:
-        # List all available docs
-        catalog = get_merged_catalog(config)
+        # List all available docs (CLI shows all by default, MCP shows only downloaded by default)
+        result = list_docs_impl(
+            config,
+            source_type=None,
+            include_large=args.large,
+            downloaded_only=False,
+            query=args.query if args.query else None,
+        )
         
-        if not args.large:
-            catalog = [e for e in catalog if not e.is_large]
-        
-        # Apply query filter
-        if args.query:
-            query_lower = args.query.lower()
-            catalog = [
-                e for e in catalog
-                if any(query_lower in field.lower() for field in [
-                    e.slug, e.name, e.type, e.release or "", e.alias or ""
-                ])
-            ]
-        
-        # Build header
-        header_parts = [f"Available documentation ({len(catalog)})"]
-        if not index_exists:
+        # Build CLI-specific output
+        header_parts = [f"Available documentation ({result.total_count})"]
+        if not result.index_exists:
             header_parts.append("[INDEX NOT BUILT]")
-        elif indexed_slugs:
-            downloaded_count = len([e for e in catalog if e.slug in config.downloaded_slugs])
-            indexed_count = len([e for e in catalog if e.slug in indexed_slugs])
-            if downloaded_count > 0 and indexed_count < downloaded_count:
-                header_parts.append(f"[{indexed_count}/{downloaded_count} indexed]")
+        elif result.indexed_slugs:
+            available_count = len([e for e, d in result.entries if d])
+            indexed_count = len([e for e, _ in result.entries if e.slug in result.indexed_slugs])
+            if available_count > 0 and indexed_count < available_count:
+                header_parts.append(f"[{indexed_count}/{available_count} indexed]")
         if args.query:
             header_parts.append(f"(matching '{args.query}')")
         
         logger.info(" ".join(header_parts) + ":\n")
         
-        for entry in catalog:
-            downloaded = "✓" if entry.slug in config.downloaded_slugs else " "
+        for entry, is_available in result.entries:
+            downloaded = "✓" if is_available else " "
             indexed_marker = ""
-            if entry.slug in config.downloaded_slugs:
-                if entry.slug in indexed_slugs:
+            if is_available:
+                if entry.slug in result.indexed_slugs:
                     indexed_marker = " [indexed]"
-                elif index_exists:
+                elif result.index_exists:
                     indexed_marker = " [NOT indexed]"
             
             logger.info("  [%s] %s%s - %s (%.1f MB)", 
                        downloaded, entry.slug, indexed_marker, entry.name, entry.size_mb)
         
         # Show helpful tips
-        downloaded_entries = [e for e in catalog if e.slug in config.downloaded_slugs]
-        if not index_exists and downloaded_entries:
+        available_entries = [e for e, d in result.entries if d]
+        if not result.index_exists and available_entries:
             logger.info("\nRun 'devdocs-mcp reindex' to create the search index.")
-        elif indexed_slugs and any(e.slug not in indexed_slugs for e in downloaded_entries):
-            unindexed = [e.slug for e in downloaded_entries if e.slug not in indexed_slugs]
+        elif result.indexed_slugs and any(e.slug not in result.indexed_slugs for e in available_entries):
+            unindexed = [e.slug for e in available_entries if e.slug not in result.indexed_slugs]
             logger.info("\nUnindexed docs: %s", ', '.join(unindexed))
             logger.info("Run 'devdocs-mcp reindex' to index them.")
+
+
+def run_info(args):
+    """Show detailed information about a specific documentation."""
+    from .config import get_config
+    from .operations import doc_info_impl
+    
+    logger = logging.getLogger(__name__)
+    config = get_config()
+    
+    # Use shared implementation
+    result = doc_info_impl(config, args.slug)
+    
+    # Format for CLI (nice user-friendly output)
+    if not result.success:
+        logger.error(result.error or f"Documentation '{args.slug}' not found.")
+        sys.exit(1)
+    
+    logger.info("=" * 60)
+    logger.info("Documentation Info: %s", result.name)
+    logger.info("=" * 60)
+    logger.info("Slug:       %s%s", args.slug, f"~{result.version}" if result.version else "")
+    logger.info("Type:       %s", result.type)
+    logger.info("Size:       %.1f MB", result.size_mb)
+    logger.info("Release:    %s", result.release)
+    logger.info("Downloaded: %s", "Yes ✓" if result.downloaded else "No")
+    
+    if result.indexed:
+        logger.info("Indexed:    Yes ✓")
+    elif result.downloaded:
+        logger.info("Indexed:    No (run 'devdocs-mcp reindex' to index)")
+    
+    if result.home_url:
+        logger.info("Homepage:   %s", result.home_url)
+    if result.code_url:
+        logger.info("Repository: %s", result.code_url)
+    
+    if result.page_count is not None:
+        logger.info("")
+        logger.info("Pages:      %d", result.page_count)
+    if result.content_size_kb is not None:
+        logger.info("Content:    %.1f KB", result.content_size_kb)
+    
+    logger.info("")
 
 
 if __name__ == "__main__":

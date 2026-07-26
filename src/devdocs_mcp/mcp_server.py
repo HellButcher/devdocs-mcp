@@ -118,53 +118,18 @@ def list_docs(
                Case-insensitive substring match. Does NOT search document content.
     """
     config = get_config()
-    catalog = get_merged_catalog(config)
     
-    # Check index status
-    index_exists = (config.cache_dir / "embeddings" / "index.faiss").exists()
-    indexed_slugs = set()
+    # Use shared implementation
+    from .operations import list_docs_impl
+    result = list_docs_impl(
+        config,
+        source_type=source_type,
+        include_large=include_large,
+        downloaded_only=downloaded_only,
+        query=query,
+    )
     
-    if index_exists:
-        try:
-            import sqlite3
-            with sqlite3.connect(str(config.metadata_db_path)) as db:
-                from .embedder import get_documents_by_slug
-                for entry in catalog:
-                    if entry.slug in config.downloaded_slugs:
-                        docs = get_documents_by_slug(db, entry.slug)
-                        if docs:
-                            indexed_slugs.add(entry.slug)
-        except Exception as e:
-            logger.warning("Failed to check index status: %s", e)
-    
-    # Apply filters
-    filtered_entries = []
-    for entry in catalog:
-        if source_type and entry.source_type != source_type:
-            continue
-        if not include_large and entry.is_large:
-            continue
-        downloaded = entry.slug in config.downloaded_slugs
-        if downloaded_only and not downloaded:
-            continue
-        
-        # Apply fuzzy text filter on metadata only (not content)
-        if query:
-            query_lower = query.lower()
-            # Search in: slug, name, type, release, alias
-            searchable_fields = [
-                entry.slug,
-                entry.name,
-                entry.type,
-                entry.release or "",
-                entry.alias or "",
-            ]
-            if not any(query_lower in field.lower() for field in searchable_fields):
-                continue
-        
-        filtered_entries.append((entry, downloaded))
-    
-    if not filtered_entries:
+    if not result.entries:
         filter_info = []
         if query:
             filter_info.append(f"query='{query}'")
@@ -178,14 +143,14 @@ def list_docs(
     
     # Build output
     results = []
-    header_parts = [f"Documentation sources ({len(filtered_entries)})"]
+    header_parts = [f"Documentation sources ({len(result.entries)})"]
     
     # Add index status to header
-    if not index_exists:
+    if not result.index_exists:
         header_parts.append("[INDEX NOT BUILT]")
-    elif indexed_slugs:
-        total_downloaded = len([e for e, d in filtered_entries if d])
-        indexed_count = len([e for e, _ in filtered_entries if e.slug in indexed_slugs])
+    elif result.indexed_slugs:
+        total_downloaded = len([e for e, d in result.entries if d])
+        indexed_count = len([e for e, _ in result.entries if e.slug in result.indexed_slugs])
         if indexed_count < total_downloaded:
             header_parts.append(f"[{indexed_count}/{total_downloaded} indexed]")
     
@@ -194,14 +159,14 @@ def list_docs(
     
     results.append(" ".join(header_parts) + ":\n")
     
-    for entry, downloaded in filtered_entries:
+    for entry, downloaded in result.entries:
         # Status markers
         markers = []
         if not downloaded_only and downloaded:
             markers.append("downloaded")
-        if downloaded and entry.slug in indexed_slugs:
+        if downloaded and entry.slug in result.indexed_slugs:
             markers.append("indexed")
-        elif downloaded and index_exists:
+        elif downloaded and result.index_exists:
             markers.append("NOT indexed")
         
         marker_str = f" [{', '.join(markers)}]" if markers else ""
@@ -214,10 +179,10 @@ def list_docs(
     
     # Add helpful tip if index not built
     footer = []
-    if not index_exists and any(d for _, d in filtered_entries):
+    if not result.index_exists and any(d for _, d in result.entries):
         footer.append("\nRun 'rebuild_index' to create the search index for downloaded docs.")
-    elif indexed_slugs and any(d and e.slug not in indexed_slugs for e, d in filtered_entries):
-        unindexed = [e.slug for e, d in filtered_entries if d and e.slug not in indexed_slugs]
+    elif result.indexed_slugs and any(d and e.slug not in result.indexed_slugs for e, d in result.entries):
+        unindexed = [e.slug for e, d in result.entries if d and e.slug not in result.indexed_slugs]
         footer.append(f"\nUnindexed docs: {', '.join(unindexed)}")
         footer.append("Run 'rebuild_index' to index them.")
     
@@ -249,73 +214,49 @@ def search_docs(
         )
 
     config = get_config()
-
-    # Check if we have any indexed documents
-    if not (config.cache_dir / "embeddings" / "index.faiss").exists():
-        return (
-            "No embeddings found. Please download and index documentation first.\n\n"
-            "Run 'download_doc' to download a doc, then 'rebuild_index' to create embeddings."
-        )
-
-    idx = _get_index()
-    if not idx._loaded:
-        try:
-            idx.load_or_create_index()
-        except Exception as e:
-            return f"Failed to load embedding index: {e}"
-
-    results = idx.search(query, top_k=top_k * 3, min_score=min_score)  # Get more for filtering
-
-    if not results:
-        return "No matching documents found. Try a different query or download more documentation."
-
-    # Fetch full document content from metadata DB
-    import sqlite3 as _sqlite3
-    db_results = []
-    try:
-        with _sqlite3.connect(str(config.metadata_db_path)) as conn:
-            for r in results:
-                doc_id = r["doc_id"]
-                doc = get_document_by_id(conn, doc_id)
-                if doc:
-                    # Apply filters
-                    if slugs and doc.get("slug") not in slugs:
-                        continue
-                    if source_type and doc.get("source_type") != source_type:
-                        continue
-                    
-                    db_results.append({**r, **doc})
-                    
-                    # Stop once we have enough filtered results
-                    if len(db_results) >= top_k:
-                        break
-    except Exception as e:
-        logger.warning("Failed to fetch document metadata: %s", e)
-        # Fallback to search results without full content
-        db_results = [{"doc_id": r["doc_id"], "score": r["score"]} for r in results[:top_k]]
-
-    if not db_results:
+    
+    # Use shared implementation
+    from .operations import search_docs_impl
+    result = search_docs_impl(
+        config,
+        query=query,
+        top_k=top_k,
+        min_score=min_score,
+        slugs=slugs,
+        source_type=source_type,
+    )
+    
+    # Format for MCP (string output)
+    if not result.success:
+        if "No embeddings found" in (result.error or ""):
+            return (
+                f"{result.error}\n\n"
+                "Run 'download_doc' to download a doc, then 'rebuild_index' to create embeddings."
+            )
+        return result.error or "Search failed."
+    
+    if not result.results:
         filter_msg = ""
-        if slugs:
-            filter_msg += f" (filtered by slugs: {', '.join(slugs)})"
-        if source_type:
-            filter_msg += f" (filtered by source_type: {source_type})"
+        if result.filtered_by.get("slugs"):
+            filter_msg += f" (filtered by slugs: {', '.join(result.filtered_by['slugs'])})"
+        if result.filtered_by.get("source_type"):
+            filter_msg += f" (filtered by source_type: {result.filtered_by['source_type']})"
         return f"No matching documents found{filter_msg}. Try adjusting your filters or query."
-
+    
     # Format results
     filter_info = []
-    if slugs:
-        filter_info.append(f"slugs: {', '.join(slugs)}")
-    if source_type:
-        filter_info.append(f"source: {source_type}")
+    if result.filtered_by.get("slugs"):
+        filter_info.append(f"slugs: {', '.join(result.filtered_by['slugs'])}")
+    if result.filtered_by.get("source_type"):
+        filter_info.append(f"source: {result.filtered_by['source_type']}")
     
-    header = f"Found {len(db_results)} matching documents"
+    header = f"Found {len(result.results)} matching documents"
     if filter_info:
         header += f" ({'; '.join(filter_info)})"
     header += ":\n\n"
     
     output_parts = [header]
-    for i, r in enumerate(db_results):
+    for i, r in enumerate(result.results):
         title = r.get("title", "Unknown")
         slug = r.get("slug", "?")
         score = r["score"]
@@ -347,7 +288,6 @@ def download_doc(slugs: list[str] | str, version: str | None = None) -> str:
         version: Optional version specifier for single slug (ignored for multiple slugs, uses latest)
     """
     config = get_config()
-    catalog = fetch_devdocs_catalog(cache_dir=config.cache_dir)
     
     # Normalize to list
     if isinstance(slugs, str):
@@ -360,113 +300,52 @@ def download_doc(slugs: list[str] | str, version: str | None = None) -> str:
 
     if not slug_list:
         return "No slugs provided. Specify at least one documentation slug."
-
-    # Initialize DB for document extraction
-    db = init_metadata_db(config.metadata_db_path)
     
-    results = {}
-    total = len(slug_list)
-    extracted_docs_count = 0
+    # Use shared implementation
+    from .operations import download_docs_impl
+    result = download_docs_impl(config, slug_list, version=version)
     
-    for i, slug in enumerate(slug_list):
-        if total > 1:
-            logger.info("Processing %d/%d: %s", i + 1, total, slug)
-        
-        # Validate slug exists in catalog
-        doc_entry = find_doc_by_slug(catalog, slug)
-        if not doc_entry:
-            results[slug] = "not found"
-            continue
-
-        # Apply version if specified (single mode only)
-        if single_mode and version and version != "":
-            full_slug = f"{slug}~{version}"
-        else:
-            full_slug = slug
-
-        # Check if already downloaded
-        if full_slug in config.downloaded_slugs:
-            results[slug] = "already downloaded"
-            continue
-
-        try:
-            # Download the documentation
-            metadata = _download_doc_impl(full_slug, config.docs_dir)
-            config.downloaded_slugs.add(full_slug)
-            
-            # Extract text for indexing
-            db_pages = get_doc_pages(full_slug, config.docs_dir)
-            if not db_pages:
-                results[slug] = "downloaded but empty"
-                continue
-
-            # Get index.json for entry-level extraction
-            index_data = get_doc_index(full_slug, config.docs_dir)
-            documents = extract_text_from_db(db_pages, full_slug, index_json=index_data)
-            
-            # Count entries vs pages for better reporting
-            entry_count = len(index_data.get("entries", [])) if index_data else 0
-            page_count = len(db_pages)
-            
-            logger.info("Extracted %d documents from '%s' (%d entries, %d pages)", 
-                       len(documents), slug, entry_count, page_count)
-
-            # Store documents in metadata DB
-            upsert_documents(db, documents)
-            extracted_docs_count += len(documents)
-            
-            results[slug] = "ok"
-        except Exception as e:
-            results[slug] = f"error: {e}"
-
-    # Save config if any downloads succeeded
-    if any(r == "ok" for r in results.values()):
-        config.save()
-
-    # Build response message
+    # Format for MCP (string output)
     if single_mode:
         slug = slug_list[0]
-        status = results[slug]
         
-        if status == "ok":
+        if slug in result.successful_slugs:
+            from .catalog import fetch_devdocs_catalog, find_doc_by_slug
+            catalog = fetch_devdocs_catalog(cache_dir=config.cache_dir)
             doc_entry = find_doc_by_slug(catalog, slug)
+            total_size_mb = result.metadata.get("total_size_mb", 0.0)
+            size_mb = doc_entry.size_mb if doc_entry else total_size_mb
             return (
-                f"Successfully downloaded '{slug}' ({doc_entry.size_mb:.1f} MB)\n"
-                f"Extracted {extracted_docs_count} documents\n\n"
+                f"Successfully downloaded '{slug}' ({size_mb:.1f} MB)\n\n"
                 "Run 'rebuild_index' to create embeddings for semantic search."
             )
-        elif status == "already downloaded":
-            return f"Documentation '{slug}' is already downloaded."
-        elif status == "not found":
-            return f"Documentation '{slug}' not found. Run 'list_docs' to see available docs."
-        elif status == "downloaded but empty":
-            return (
-                f"Downloaded '{slug}' but no page content found.\n"
-                "The doc may be empty or in an unexpected format."
-            )
+        elif slug in result.failed_slugs:
+            error_msg = result.errors.get(slug, "Unknown error")
+            if "not found" in error_msg:
+                return f"Documentation '{slug}' not found. Run 'list_docs' to see available docs."
+            return f"Failed to download '{slug}': {error_msg}"
         else:
-            return f"Failed to download '{slug}': {status}"
+            return f"Documentation '{slug}' is already downloaded."
     else:
         # Batch mode response
-        success_count = sum(1 for v in results.values() if v == "ok")
-        already_count = sum(1 for v in results.values() if v == "already downloaded")
-        failed = [f"{s}: {r}" for s, r in results.items() if r not in ["ok", "already downloaded"]]
+        success_count = len(result.successful_slugs)
+        failed_count = len(result.failed_slugs)
+        total = len(slug_list)
         
         msg_parts = []
         if success_count > 0:
             msg_parts.append(f"Downloaded {success_count}/{total} docs successfully")
-        if already_count > 0:
-            msg_parts.append(f"{already_count} already downloaded")
         
-        msg = ", ".join(msg_parts) + ".\n\n"
+        msg = ", ".join(msg_parts) + ".\n\n" if msg_parts else ""
         
-        if failed:
-            msg += "Failed:\n" + "\n".join(f"  - {f}" for f in failed) + "\n\n"
+        if failed_count > 0:
+            failed_list = [f"{s}: {result.errors.get(s, 'error')}" for s in result.failed_slugs]
+            msg += "Failed:\n" + "\n".join(f"  - {f}" for f in failed_list) + "\n\n"
         
         if success_count > 0:
             msg += "Run 'rebuild_index' to create embeddings for semantic search."
         
-        return msg if msg_parts else f"All downloads failed: {', '.join(failed)}"
+        return msg if msg_parts else f"All downloads failed."
 
 
 @mcp.tool()
@@ -491,147 +370,39 @@ def rebuild_index(clean: bool = False, slugs: list[str] | None = None) -> str:
         )
 
     config = get_config()
-
-    # Clean mode: drop and recreate database
-    if clean:
-        logger.info("Clean mode: rebuilding entire index...")
-        if config.metadata_db_path.exists():
-            config.metadata_db_path.unlink()
-            logger.info("Dropped old database")
-        if config.faiss_index_path.exists():
-            config.faiss_index_path.unlink()
-            logger.info("Dropped old FAISS index")
-
-    # Initialize metadata DB if needed
-    db = init_metadata_db(config.metadata_db_path)
-
-    # Get embedding index (will auto-install dependencies if needed)
-    idx = _get_index()
-    idx.load_or_create_index()
-
-    # Process all downloaded docs from devdocs.io
-    total_docs = 0
-    total_embeddings = 0
-    downloaded = list_downloaded_docs(config.docs_dir)
-    total_slugs = len(downloaded)
-
-    # If specific slugs requested, filter to only those
-    if slugs:
-        # Validate that requested slugs are downloaded
-        not_downloaded = [s for s in slugs if s not in downloaded]
-        if not_downloaded:
-            return (
-                f"The following docs are not downloaded: {', '.join(not_downloaded)}\n\n"
-                f"Download them first with: download_doc(slug)\n\n"
-                f"Available docs: {', '.join(sorted(downloaded))}"
-            )
-        slugs_to_index = slugs
-        logger.info("Re-indexing specific docs: %s", ', '.join(slugs))
-        
-        # Delete existing entries for these slugs
-        from .embedder import get_documents_by_slug
-        for slug in slugs:
-            existing_docs = get_documents_by_slug(db, slug)
-            if existing_docs:
-                doc_ids_to_delete = [doc['id'] for doc in existing_docs]
-                logger.info("Removing %d existing documents for %s", len(doc_ids_to_delete), slug)
-                
-                # Remove from FAISS index and database
-                idx.remove_documents(doc_ids_to_delete)
-    else:
-        # Get already-indexed slugs (unless clean mode)
-        from .embedder import get_documents_by_slug
-        indexed_slugs = set()
-        if not clean:
-            for slug in downloaded:
-                existing_docs = get_documents_by_slug(db, slug)
-                if existing_docs:
-                    indexed_slugs.add(slug)
-
-        # Filter to only missing slugs (unless clean)
-        slugs_to_index = [s for s in downloaded if s not in indexed_slugs]
-
-        if not slugs_to_index and not clean:
-            return (
-                "All downloaded documentation is already indexed.\n\n"
-                "Use clean=True to rebuild the entire index from scratch,\n"
-                "or specify slugs=['doc1', 'doc2'] to re-index specific docs."
-            )
-
-        if indexed_slugs and not clean:
-            logger.info("Skipping %d already-indexed docs", len(indexed_slugs))
-
-    logger.info("Indexing %d documentation bundles...", len(slugs_to_index))
     
-    for i, slug in enumerate(slugs_to_index):
-        logger.info("Processing %d/%d: %s", i + 1, len(slugs_to_index), slug)
-        
-        db_pages = get_doc_pages(slug, config.docs_dir)
-        if not db_pages:
-            continue
-
-        # Get index.json for entry-level extraction
-        index_data = get_doc_index(slug, config.docs_dir)
-
-        # Extract documents from devdocs bundle
-        docs = extract_text_from_db(db_pages, slug, index_json=index_data)
-        if not docs:
-            continue
-
-        # Insert into metadata DB
-        count = upsert_documents(db, docs)
-        total_docs += count
-
-        # Prepare texts for embedding
-        doc_ids = [d.id for d in docs]
-        texts = [d.content for d in docs]
-
-        # Add to FAISS index
-        emb_count = idx.add_documents(texts, doc_ids)
-        total_embeddings += emb_count
-
-    # Also process local sources
-    for src in config.sources:
-        if isinstance(src, LocalSource):
-            local_docs_dir = Path(src.path) / "docs"
-            if not local_docs_dir.exists():
-                continue
-            for slug_entry in local_docs_dir.iterdir():
-                if not slug_entry.is_dir():
-                    continue
-                docs = extract_text_from_local(config.cache_dir, slug_entry.name)
-                if not docs:
-                    continue
-
-                count = upsert_documents(db, docs)
-                total_docs += count
-
-                doc_ids = [d.id for d in docs]
-                texts = [d.content for d in docs]
-                emb_count = idx.add_documents(texts, doc_ids)
-                total_embeddings += emb_count
-
-    # Save the index
-    idx.save_index()
-
+    # Use shared implementation
+    from .operations import rebuild_index_impl
+    result = rebuild_index_impl(config, clean=clean, slugs=slugs)
+    
+    # Format result for MCP (string output)
+    if not result.success:
+        if result.error:
+            return (
+                f"{result.error}\n\n"
+                f"Download them first with: download_doc(slug) or add as local source\n\n"
+                f"Total available docs: {result.total_available}"
+            )
+        else:
+            return result.error or "Index operation failed."
+    
     # Build appropriate message based on mode
-    if slugs:
-        mode_msg = f"re-indexed {len(slugs)} specific doc(s)"
-        slug_list = ', '.join(slugs)
+    if result.mode == "specific":
+        slug_list = ', '.join(result.slugs_processed)
         return (
-            f"Successfully {mode_msg}: {slug_list}\n"
-            f"- {total_docs} documents indexed\n"
-            f"- {total_embeddings} embeddings created\n\n"
+            f"Successfully re-indexed {len(result.slugs_processed)} specific doc(s): {slug_list}\n"
+            f"- {result.total_docs} documents indexed\n"
+            f"- {result.total_embeddings} embeddings created\n\n"
             "You can now use 'search_docs' to find information."
         )
     else:
-        mode_msg = "rebuilt from scratch" if clean else "updated with new documents"
+        mode_msg = "rebuilt from scratch" if result.mode == "clean" else "updated with new documents"
         return (
             f"Index {mode_msg} successfully!\n"
-            f"- {total_docs} documents indexed\n"
-            f"- {total_embeddings} new embeddings created\n"
-            f"- Total docs in index: {total_slugs}\n"
-            f"- New docs added: {len(slugs_to_index)}\n\n"
+            f"- {result.total_docs} documents indexed\n"
+            f"- {result.total_embeddings} new embeddings created\n"
+            f"- Total available docs: {result.total_available} ({result.devdocs_count} devdocs, {result.local_count} local)\n"
+            f"- New docs added: {result.new_docs_added}\n\n"
             "You can now use 'search_docs' to find information."
         )
 
@@ -673,31 +444,73 @@ def add_local_source(path: str, slug_prefix: str = "") -> str:
         slug_prefix: Optional prefix for generated slugs (e.g. 'mylib/')
     """
     config = get_config()
-
-    # Validate path exists and is a directory
-    path_obj = Path(path).expanduser().resolve()
-    if not path_obj.exists():
-        return f"Path '{path}' does not exist."
     
-    if not path_obj.is_dir():
-        return f"Path '{path}' is not a directory."
+    # Use shared implementation
+    from .operations import add_local_source_impl
+    result = add_local_source_impl(config, path, slug_prefix)
     
-    # Check if directory contains HTML files
-    html_files = list(path_obj.glob("*.html")) + list(path_obj.glob("*.htm"))
-    if not html_files:
-        return f"No HTML files found in '{path}'. Add at least one .html or .htm file."
-
-    # Add to sources
-    source = LocalSource(path=str(path_obj), slug_prefix=slug_prefix)
-    config.sources.append(source)
-    config.save()
-
-    # Index the local docs
-    entries = index_local_directory(str(path_obj), slug_prefix)
+    # Format for MCP (string output)
+    if not result.success:
+        error_msg = list(result.errors.values())[0] if result.errors else "Failed to add local source."
+        return error_msg
+    
+    path_str = result.metadata.get("path", path)
+    num_files = result.metadata.get("num_files", len(result.successful_slugs))
     return (
-        f"Added local source '{path_obj}'\n"
-        f"- {len(entries)} HTML files indexed\n"
-        "Run 'rebuild_index' to create embeddings for these docs."
+        f"Added local source '{path_str}'\n"
+        f"- {num_files} HTML files found\n"
+        f"Run 'rebuild_index' to create embeddings for these docs."
+    )
+
+
+@mcp.tool()
+def add_web_source(
+    slug: str,
+    url: str | None = None,
+    name: str | None = None,
+    max_depth: int = 2,
+    pattern: str = r".*\.html?$",
+    url_prefix: str | None = None,
+) -> str:
+    r"""Fetch documentation from a web URL (or re-download existing source).
+    
+    If url is not provided, re-downloads an existing web source by slug.
+    
+    By default, only fetches URLs in the same directory or below the initial URL.
+    For example, fetching https://example.com/docs/api/index.html will only fetch
+    files under https://example.com/docs/api/ and not https://example.com/docs/other/.
+    
+    Only HTML files (.html, .htm, or no extension) are fetched and followed.
+    Non-HTML files (CSS, JS, images, fonts, etc.) are automatically skipped.
+
+    Args:
+        slug: Unique identifier for this web source
+        url: Base URL to fetch from (optional for re-download)
+        name: Display name (defaults to slug)
+        max_depth: Recursion depth for crawling (default: 2)
+        pattern: Regex pattern for URLs to fetch (default: .*\.html?$)
+        url_prefix: Optional URL prefix to restrict crawling (default: directory of initial URL)
+    """
+    config = get_config()
+    
+    # Use shared implementation
+    from .operations import add_web_source_impl
+    result = add_web_source_impl(config, url, slug, name, max_depth, pattern, url_prefix)
+    
+    # Format for MCP (string output)
+    if not result.success:
+        error_msg = list(result.errors.values())[0] if result.errors else "Failed to fetch web source."
+        return error_msg
+    
+    url_str = result.metadata.get("url", url or "existing source")
+    num_files = result.metadata.get("num_files", len(result.successful_slugs))
+    
+    action = "Re-downloaded" if not url else "Fetched"
+    return (
+        f"{action} web source from '{url_str}'\n"
+        f"- {num_files} HTML files downloaded\n"
+        f"- Slug: {slug}\n"
+        f"Run 'rebuild_index' to create embeddings for these docs."
     )
 
 
@@ -731,34 +544,38 @@ def doc_info(slug: str) -> str:
         slug: Documentation slug (e.g. 'javascript', 'async')
     """
     config = get_config()
-    catalog = fetch_devdocs_catalog(cache_dir=config.cache_dir)
-    doc_entry = find_doc_by_slug(catalog, slug)
-
-    if not doc_entry:
-        return f"Documentation '{slug}' not found in the devdocs.io catalog."
-
-    downloaded = slug in config.downloaded_slugs
-    db_pages = get_doc_pages(slug, config.docs_dir) if downloaded else None
-
+    
+    # Use shared implementation
+    from .operations import doc_info_impl
+    result = doc_info_impl(config, slug)
+    
+    # Format for MCP (string output)
+    if not result.success:
+        return result.error or f"Documentation '{slug}' not found."
+    
     info_lines = [
-        f"Name: {doc_entry.name}",
-        f"Slug: {slug}" + (f"~{doc_entry.version}" if doc_entry.version else ""),
-        f"Type: {doc_entry.type}",
-        f"Size: {doc_entry.size_mb:.1f} MB",
-        f"Release: {doc_entry.release or 'N/A'}",
-        f"Downloaded: {'Yes' if downloaded else 'No'}",
+        f"Name: {result.name}",
+        f"Slug: {slug}" + (f"~{result.version}" if result.version else ""),
+        f"Type: {result.type}",
+        f"Size: {result.size_mb:.1f} MB",
+        f"Release: {result.release}",
+        f"Downloaded: {'Yes' if result.downloaded else 'No'}",
     ]
+    
+    if result.indexed:
+        info_lines.append(f"Indexed: Yes")
+    elif result.downloaded:
+        info_lines.append(f"Indexed: No (run 'rebuild_index' to index)")
 
-    if doc_entry.home_url:
-        info_lines.append(f"Homepage: {doc_entry.home_url}")
-    if doc_entry.code_url:
-        info_lines.append(f"Repository: {doc_entry.code_url}")
+    if result.home_url:
+        info_lines.append(f"Homepage: {result.home_url}")
+    if result.code_url:
+        info_lines.append(f"Repository: {result.code_url}")
 
-    if db_pages:
-        page_count = len(db_pages)
-        total_size = sum(len(str(v)) for v in db_pages.values())
-        info_lines.append(f"\nPages: {page_count}")
-        info_lines.append(f"Total content size: {total_size / 1024:.1f} KB")
+    if result.page_count is not None:
+        info_lines.append(f"\nPages: {result.page_count}")
+    if result.content_size_kb is not None:
+        info_lines.append(f"Total content size: {result.content_size_kb:.1f} KB")
 
     return "\n".join(info_lines)
 

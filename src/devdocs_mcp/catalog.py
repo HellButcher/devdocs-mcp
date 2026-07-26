@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from .config import Config, DevdocsSource, LocalSource
+from .config import Config, DevdocsSource, LocalSource, WebSource
 from .http_utils import http_get_with_retry
 
 logger = logging.getLogger(__name__)
@@ -190,7 +190,10 @@ def index_local_directory(
 # ---------------------------------------------------------------------------
 
 def get_merged_catalog(config: Config) -> list[DocEntry]:
-    """Build the full catalog by merging devdocs.io + custom sources."""
+    """Build the full catalog by merging devdocs.io + custom sources.
+    
+    Uses cached entries for local sources to avoid rescanning the filesystem.
+    """
     all_entries: list[DocEntry] = []
 
     for src in config.sources:
@@ -202,11 +205,36 @@ def get_merged_catalog(config: Config) -> list[DocEntry]:
                 logger.warning("Failed to fetch devdocs catalog: %s", exc)
 
         elif isinstance(src, LocalSource):
-            try:
-                entries = index_local_directory(src.path, src.slug_prefix or "")
-                all_entries.extend(entries)
-            except Exception as exc:
-                logger.warning("Failed to index local source %s: %s", src.path, exc)
+            # Each LocalSource is a single catalog entry
+            all_entries.append(DocEntry(
+                slug=src.slug,
+                name=src.name,
+                version="",
+                type="local",
+                db_size=0,  # Calculated on-demand
+                release="",
+                mtime=0,
+                alias="",
+                home_url=None,
+                code_url=None,
+                source_type="local",
+            ))
+        
+        elif isinstance(src, WebSource):
+            # Each WebSource is a single catalog entry
+            all_entries.append(DocEntry(
+                slug=src.slug,
+                name=src.name,
+                version="",
+                type="web",
+                db_size=0,  # Calculated on-demand
+                release="",
+                mtime=0,
+                alias="",
+                home_url=src.url,
+                code_url=None,
+                source_type="web",
+            ))
 
     # Deduplicate by slug (keep first occurrence)
     seen: set[str] = set()

@@ -55,7 +55,17 @@ EMBEDDING_MODEL = os.environ.get(
 class LocalSource:
     """A local directory containing static HTML documentation."""
     path: str  # absolute filesystem path
-    slug_prefix: str = ""  # optional prefix to prepend to auto-generated slugs
+    slug: str  # unique slug for this local source
+    name: str  # display name
+
+
+@dataclass
+class WebSource:
+    """A web-fetched documentation source."""
+    url: str  # base URL that was fetched
+    slug: str  # unique slug for this web source
+    name: str  # display name
+    cache_path: str  # where the downloaded files are stored
 
 
 @dataclass
@@ -68,7 +78,7 @@ class DevdocsSource:
 class Config:
     cache_dir: Path = field(default_factory=lambda: CACHE_DIR)
     config_dir: Path = field(default_factory=lambda: CONFIG_DIR)
-    sources: list[LocalSource | DevdocsSource] = field(default_factory=list)
+    sources: list[LocalSource | WebSource | DevdocsSource] = field(default_factory=list)
 
     # Track which devdocs slugs are downloaded
     downloaded_slugs: set[str] = field(default_factory=set)
@@ -84,6 +94,11 @@ class Config:
     @property
     def docs_dir(self) -> Path:
         return self.cache_dir / "docs"
+    
+    @property
+    def web_docs_dir(self) -> Path:
+        """Directory for web-fetched documentation."""
+        return self.cache_dir / "web"
 
     @property
     def embeddings_dir(self) -> Path:
@@ -96,6 +111,16 @@ class Config:
     @property
     def metadata_db_path(self) -> Path:
         return self.embeddings_dir / "metadata.db"
+    
+    @property
+    def local_sources(self) -> list[LocalSource]:
+        """Return only LocalSource instances."""
+        return [s for s in self.sources if isinstance(s, LocalSource)]
+    
+    @property
+    def web_sources(self) -> list[WebSource]:
+        """Return only WebSource instances."""
+        return [s for s in self.sources if isinstance(s, WebSource)]
 
     @classmethod
     def load(cls, config_dir: Path | None = None) -> Config:
@@ -108,12 +133,20 @@ class Config:
             return cfg
 
         data = json.loads(p.read_text())
-        sources: list[LocalSource | DevdocsSource] = []
+        sources: list[LocalSource | WebSource | DevdocsSource] = []
         for s in data.get("sources", []):
             if s.get("type") == "local":
                 sources.append(LocalSource(
                     path=s["path"],
-                    slug_prefix=s.get("slug_prefix", ""),
+                    slug=s["slug"],
+                    name=s["name"],
+                ))
+            elif s.get("type") == "web":
+                sources.append(WebSource(
+                    url=s["url"],
+                    slug=s["slug"],
+                    name=s["name"],
+                    cache_path=s["cache_path"],
                 ))
             else:
                 sources.append(DevdocsSource(enabled=s.get("enabled", True)))
@@ -134,7 +167,16 @@ class Config:
                 src_list.append({
                     "type": "local",
                     "path": s.path,
-                    "slug_prefix": s.slug_prefix or "",
+                    "slug": s.slug,
+                    "name": s.name,
+                })
+            elif isinstance(s, WebSource):
+                src_list.append({
+                    "type": "web",
+                    "url": s.url,
+                    "slug": s.slug,
+                    "name": s.name,
+                    "cache_path": s.cache_path,
                 })
             else:
                 src_list.append({

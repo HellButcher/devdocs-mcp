@@ -114,14 +114,10 @@ class EmbeddingIndex:
             # Load FAISS index
             self.faiss_index = faiss.read_index(str(idx_path))
             self._loaded = True
-
-            # IDs are in SQLite documents table
-            with sqlite3.connect(str(self.metadata_db_path)) as db:
-                count = db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             
             logger.info(
                 "Loaded index with %d embeddings from %s",
-                count, idx_path
+                self.faiss_index.ntotal, idx_path
             )
         else:
             # Create new empty index
@@ -158,17 +154,27 @@ class EmbeddingIndex:
         import numpy as np
         from .embedder import get_faiss_ids_for_doc_ids
 
-        # Check which docs are already indexed
-        new_texts = []
-        new_ids = []
-        
+        # Get FAISS IDs for all doc_ids (these should already be in the metadata DB)
         with sqlite3.connect(str(self.metadata_db_path)) as db:
-            existing = get_faiss_ids_for_doc_ids(db, doc_ids)
-            
-            for text, doc_id in zip(texts, doc_ids):
-                if doc_id not in existing:
+            faiss_ids_map = get_faiss_ids_for_doc_ids(db, doc_ids)
+        
+        # Check which docs are already in the FAISS index (not just the DB)
+        new_texts = []
+        new_faiss_ids = []
+        
+        for text, doc_id in zip(texts, doc_ids):
+            if doc_id in faiss_ids_map:
+                faiss_id = faiss_ids_map[doc_id]
+                # Check if this FAISS ID exists in the FAISS index
+                try:
+                    # Try to reconstruct the vector - if it exists, skip it
+                    self.faiss_index.reconstruct(faiss_id)
+                    # Document exists in FAISS, skip it
+                    continue
+                except RuntimeError:
+                    # Document not in FAISS, add it
                     new_texts.append(text)
-                    new_ids.append(doc_id)
+                    new_faiss_ids.append(faiss_id)
 
         if not new_texts:
             logger.info("No new documents to embed")
@@ -177,23 +183,17 @@ class EmbeddingIndex:
         # Generate embeddings
         embeddings = self.model.encode(new_texts, normalize_embeddings=True)
 
-        # Get FAISS IDs (id column) for the new documents
-        with sqlite3.connect(str(self.metadata_db_path)) as db:
-            faiss_ids_map = get_faiss_ids_for_doc_ids(db, new_ids)
-        
-        faiss_ids = [faiss_ids_map[doc_id] for doc_id in new_ids]
-
         # Add to FAISS index with document IDs
         self.faiss_index.add_with_ids(
             embeddings.astype("float32"),
-            np.array(faiss_ids, dtype=np.int64)
+            np.array(new_faiss_ids, dtype=np.int64)
         )
 
         logger.info(
             "Added %d documents to index (total: %d)",
-            len(new_ids), self.get_doc_count()
+            len(new_texts), self.faiss_index.ntotal
         )
-        return len(new_ids)
+        return len(new_texts)
 
     def remove_documents(self, doc_ids: list[str]) -> int:
         """Remove documents from the embedding index.
@@ -286,11 +286,8 @@ class EmbeddingIndex:
         return results
 
     def get_doc_count(self) -> int:
-        """Get total number of documents in the index."""
-        from .embedder import count_documents
-        
-        with sqlite3.connect(str(self.metadata_db_path)) as db:
-            return count_documents(db)
+        """Get total number of documents in the FAISS index."""
+        return self.faiss_index.ntotal
 
     @property
     def is_empty(self) -> bool:
