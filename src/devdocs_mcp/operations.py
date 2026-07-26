@@ -128,12 +128,25 @@ def rebuild_index_impl(
     # Clean mode: drop and recreate database
     if clean:
         logger.info("Clean mode: rebuilding entire index...")
-        if config.metadata_db_path.exists():
-            config.metadata_db_path.unlink()
-            logger.info("Dropped old database")
         if config.faiss_index_path.exists():
             config.faiss_index_path.unlink()
             logger.info("Dropped old FAISS index")
+        if config.metadata_db_path.exists():
+            # Ensure file is closed before unlinking
+            import gc
+            gc.collect()  # Force garbage collection to close any open handles
+            
+            # Remove SQLite database and its WAL/SHM files
+            config.metadata_db_path.unlink()
+            # Remove WAL (Write-Ahead Log) file if exists
+            wal_path = config.metadata_db_path.with_suffix('.db-wal')
+            if wal_path.exists():
+                wal_path.unlink()
+            # Remove SHM (Shared Memory) file if exists
+            shm_path = config.metadata_db_path.with_suffix('.db-shm')
+            if shm_path.exists():
+                shm_path.unlink()
+            logger.info("Dropped old database")
 
     # Initialize metadata DB if needed
     db = init_metadata_db(config.metadata_db_path)

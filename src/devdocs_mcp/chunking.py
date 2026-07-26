@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Protocol
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DocumentChunk:
+    """A chunk of document with metadata."""
+    text: str
+    title_hint: str | None = None  # Suggested title from first heading or sentence
 
 
 class ChunkingStrategy(Protocol):
@@ -215,7 +223,7 @@ def chunk_document(
     max_tokens: int = 512,
     strategy: str = "sentence",
     overlap: int = 50,
-) -> list[str]:
+) -> list[DocumentChunk]:
     """Chunk a document using the specified strategy.
     
     Args:
@@ -225,11 +233,87 @@ def chunk_document(
         overlap: Token overlap between chunks
         
     Returns:
-        List of text chunks
+        List of DocumentChunk objects with text and title hints
     """
     if strategy == "paragraph":
         chunker = ParagraphChunker(overlap=overlap)
     else:
         chunker = SentenceChunker(overlap=overlap)
     
-    return chunker.chunk(text, max_tokens=max_tokens)
+    text_chunks = chunker.chunk(text, max_tokens=max_tokens)
+    
+    # Convert to DocumentChunk with title hints
+    chunks_with_metadata = []
+    for chunk_text in text_chunks:
+        title_hint = _extract_title_hint(chunk_text)
+        chunks_with_metadata.append(DocumentChunk(
+            text=chunk_text,
+            title_hint=title_hint
+        ))
+    
+    return chunks_with_metadata
+
+
+def _extract_title_hint(text: str, max_length: int = 80) -> str | None:
+    """Extract a title hint from chunk text.
+    
+    Tries to find:
+    1. First heading-like line (all caps, or ends with colon)
+    2. First sentence
+    3. First line
+    
+    Args:
+        text: Chunk text
+        max_length: Maximum length for title hint
+        
+    Returns:
+        Title hint string or None
+    """
+    if not text.strip():
+        return None
+    
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if not lines:
+        return None
+    
+    # Look for heading-like patterns in first few lines
+    for line in lines[:3]:
+        # Skip very short lines
+        if len(line) < 3:
+            continue
+            
+        # Check if it looks like a heading
+        # - All caps (with some tolerance for punctuation)
+        # - Ends with colon
+        # - Short line followed by longer content
+        words = line.split()
+        if len(words) > 0 and len(words) <= 10:
+            # All caps check (at least 60% uppercase)
+            alpha_chars = [c for c in line if c.isalpha()]
+            if alpha_chars:
+                upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
+                if upper_ratio > 0.6:
+                    return line[:max_length]
+            
+            # Ends with colon
+            if line.endswith(':'):
+                return line[:-1][:max_length]  # Remove colon
+    
+    # Fallback: use first sentence or first line
+    first_line = lines[0]
+    
+    # Try to extract first sentence
+    sentences = re.split(r'[.!?]\s+', first_line)
+    if sentences:
+        first_sentence = sentences[0].strip()
+        if first_sentence:
+            # Truncate if too long
+            if len(first_sentence) > max_length:
+                return first_sentence[:max_length-3] + "..."
+            return first_sentence
+    
+    # Fallback to first line
+    if len(first_line) > max_length:
+        return first_line[:max_length-3] + "..."
+    return first_line
+

@@ -87,15 +87,33 @@ def _extract_pages_from_db(db_json: dict[str, Any], slug: str, max_chunk_tokens:
         # Chunk large documents
         chunks = chunk_document(text, max_tokens=max_chunk_tokens)
         
-        for i, chunk_text in enumerate(chunks):
-            doc_id_suffix = f"#{i}" if len(chunks) > 1 else ""
+        for i, chunk in enumerate(chunks):
+            # Generate section identifier from title hint if available
+            if len(chunks) > 1:
+                if chunk.title_hint:
+                    section = _slugify_section(chunk.title_hint)
+                    doc_id_suffix = f"#{section}"
+                else:
+                    doc_id_suffix = f"#{i}"
+            else:
+                doc_id_suffix = ""
+            
             doc_id = f"{slug}#{path}{doc_id_suffix}" if "#" in path else f"{slug}/{path.replace('/', '#')}{doc_id_suffix}"
+
+            # Generate better chunk title
+            if len(chunks) > 1:
+                if chunk.title_hint:
+                    chunk_title = f"{title}: {chunk.title_hint}"
+                else:
+                    chunk_title = f"{title} (part {i+1}/{len(chunks)})"
+            else:
+                chunk_title = title
 
             docs.append(SearchDocument(
                 id=doc_id,
                 slug=slug,
-                title=f"{title} (part {i+1}/{len(chunks)})" if len(chunks) > 1 else title,
-                content=chunk_text.strip(),
+                title=chunk_title,
+                content=chunk.text.strip(),
                 source_type="devdocs",
             ))
 
@@ -171,15 +189,33 @@ def _extract_entries_from_index(
             
             chunks = chunk_document(text, max_tokens=max_chunk_tokens)
             
-            for i, chunk_text in enumerate(chunks):
-                doc_id_suffix = f"#{i}" if len(chunks) > 1 else ""
+            for i, chunk in enumerate(chunks):
+                # Generate section identifier from title hint if available
+                if len(chunks) > 1:
+                    if chunk.title_hint:
+                        section = _slugify_section(chunk.title_hint)
+                        doc_id_suffix = f"#{section}"
+                    else:
+                        doc_id_suffix = f"#{i}"
+                else:
+                    doc_id_suffix = ""
+                
                 doc_id = f"{slug}#{path}{doc_id_suffix}"
+                
+                # Generate better chunk title
+                if len(chunks) > 1:
+                    if chunk.title_hint:
+                        chunk_title = f"{name}: {chunk.title_hint}"
+                    else:
+                        chunk_title = f"{name} (part {i+1}/{len(chunks)})"
+                else:
+                    chunk_title = name
                 
                 docs.append(SearchDocument(
                     id=doc_id,
                     slug=slug,
-                    title=f"{name} (part {i+1}/{len(chunks)})" if len(chunks) > 1 else name,
-                    content=chunk_text.strip(),
+                    title=chunk_title,
+                    content=chunk.text.strip(),
                     type=entry_type,
                     path=path,
                     source_type="devdocs",
@@ -243,6 +279,39 @@ def _extract_title(tree: Any, default: str) -> str:
     
     # Fallback to default
     return default.replace("_", " ").title()
+
+
+def _slugify_section(text: str, max_length: int = 50) -> str:
+    """Convert text to a URL-friendly section identifier.
+    
+    Args:
+        text: Text to slugify
+        max_length: Maximum length of the slug
+        
+    Returns:
+        Slugified text suitable for use in doc IDs
+    """
+    import re
+    
+    # Convert to lowercase
+    slug = text.lower()
+    
+    # Replace spaces and special chars with hyphens
+    slug = re.sub(r'[^\w\s-]', '', slug)
+    slug = re.sub(r'[-\s]+', '-', slug)
+    
+    # Remove leading/trailing hyphens
+    slug = slug.strip('-')
+    
+    # Truncate to max length at word boundary
+    if len(slug) > max_length:
+        slug = slug[:max_length]
+        # Try to break at last hyphen
+        last_hyphen = slug.rfind('-')
+        if last_hyphen > max_length // 2:  # Only if not too short
+            slug = slug[:last_hyphen]
+    
+    return slug or "section"  # Fallback if empty
 
 
 def scan_local_directory(base_path: Path) -> list[Path]:
@@ -313,20 +382,43 @@ def extract_text_from_local(
         logger.info("  Created %d chunks", len(chunks))
         sys.stderr.flush()
     
-    for i, chunk_text in enumerate(chunks):
+    for i, chunk in enumerate(chunks):
         # Generate unique ID for each chunk
-        doc_id_suffix = f"#{i}" if len(chunks) > 1 else ""
-        doc_id = f"{source_type}/{slug}/{f.stem}{doc_id_suffix}"
+        # Use consistent format across all source types: {slug}#{path}#{section}
         
-        # Add part number to title if multiple chunks
-        chunk_title = f"{title} (part {i+1}/{len(chunks)})" if len(chunks) > 1 else title
+        # For web sources, use the filename as the path (without .html extension)
+        # For local sources, also use the filename as the path
+        # This matches the devdocs format: slug#path#section
+        path = f.stem  # Remove .html/.htm extension
+        
+        # Generate section identifier from title hint if available
+        if len(chunks) > 1:
+            if chunk.title_hint:
+                # Convert title hint to a URL-friendly section name
+                section = _slugify_section(chunk.title_hint)
+                doc_id = f"{slug}#{path}#{section}"
+            else:
+                # Fallback to numeric index if no title hint
+                doc_id = f"{slug}#{path}#{i}"
+        else:
+            doc_id = f"{slug}#{path}"
+        
+        # Generate better chunk title
+        if len(chunks) > 1:
+            if chunk.title_hint:
+                chunk_title = f"{title}: {chunk.title_hint}"
+            else:
+                chunk_title = f"{title} (part {i+1}/{len(chunks)})"
+        else:
+            chunk_title = title
         
         docs.append(SearchDocument(
             id=doc_id,
             slug=slug,
             title=chunk_title,
-            content=chunk_text.strip(),
+            content=chunk.text.strip(),
             source_type=source_type,
+            path=path,  # Add path field for consistency
         ))
     
     return docs
