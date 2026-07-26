@@ -72,6 +72,7 @@ class WebSource:
 class DevdocsSource:
     """devdocs.io catalog source."""
     enabled: bool = True
+    exclude_patterns: list[str] = field(default_factory=list)  # Patterns to exclude from catalog (e.g., ["angular*", "react*"])
 
 
 @dataclass
@@ -149,7 +150,10 @@ class Config:
                     cache_path=s["cache_path"],
                 ))
             else:
-                sources.append(DevdocsSource(enabled=s.get("enabled", True)))
+                sources.append(DevdocsSource(
+                    enabled=s.get("enabled", True),
+                    exclude_patterns=s.get("exclude_patterns", [])
+                ))
 
         return cls(
             cache_dir=CACHE_DIR,
@@ -182,6 +186,7 @@ class Config:
                 src_list.append({
                     "type": "devdocs",
                     "enabled": s.enabled,
+                    "exclude_patterns": s.exclude_patterns,
                 })
 
         json.dump({

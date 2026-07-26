@@ -193,14 +193,38 @@ def get_merged_catalog(config: Config) -> list[DocEntry]:
     """Build the full catalog by merging devdocs.io + custom sources.
     
     Uses cached entries for local sources to avoid rescanning the filesystem.
+    Filters out devdocs entries based on exclude_patterns in DevdocsSource.
     """
+    import fnmatch
+    
     all_entries: list[DocEntry] = []
 
     for src in config.sources:
         if isinstance(src, DevdocsSource) and src.enabled:
             try:
                 entries = fetch_devdocs_catalog(cache_dir=config.cache_dir)
-                all_entries.extend(entries)
+                
+                # Filter out excluded patterns
+                if src.exclude_patterns:
+                    filtered_entries = []
+                    for entry in entries:
+                        # Check if slug matches any exclude pattern
+                        excluded = False
+                        for pattern in src.exclude_patterns:
+                            if fnmatch.fnmatch(entry.slug, pattern):
+                                excluded = True
+                                break
+                        if not excluded:
+                            filtered_entries.append(entry)
+                    
+                    logger.debug(
+                        "Filtered devdocs catalog: %d entries excluded by patterns %s",
+                        len(entries) - len(filtered_entries),
+                        src.exclude_patterns
+                    )
+                    all_entries.extend(filtered_entries)
+                else:
+                    all_entries.extend(entries)
             except Exception as exc:
                 logger.warning("Failed to fetch devdocs catalog: %s", exc)
 
