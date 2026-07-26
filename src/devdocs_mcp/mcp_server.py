@@ -263,6 +263,7 @@ def search_docs(
         doc_type = r.get("type", "")
         path = r.get("path", "")
         doc_source = r.get("source_type", "")
+        doc_id = r.get("id", "")
 
         # Truncate content for display
         content_preview = r.get("content", "")[:300]
@@ -271,10 +272,63 @@ def search_docs(
             f"### {i+1}. [{title}]({slug}) [score: {score:.3f}]"
             + (f" ({doc_type})" if doc_type else "")
             + (f" [{doc_source}]" if doc_source else "")
+            + (f"\nDoc ID: {doc_id}" if doc_id else "")
             + (f"\nPath: {path}" if path else "")
             + f"\n\n{content_preview}\n"
+            + f"\n_Use `get_document(\"{doc_id}\")` to retrieve full content._\n"
         )
 
+    return "\n".join(output_parts)
+
+
+@mcp.tool()
+def get_document(doc_id: str) -> str:
+    """Get full document content by document ID from search results.
+    
+    Use this to retrieve the complete content of a document after finding it via search_docs.
+    The doc_id can be found in search results (typically shown in the path or title).
+
+    Args:
+        doc_id: Document ID from search results (e.g. "python~3.13/library/functions#print")
+    """
+    config = get_config()
+    
+    # Use shared implementation
+    from .operations import get_document_impl
+    result = get_document_impl(config, doc_id)
+    
+    # Format for MCP (string output)
+    if not result.success:
+        return result.error or "Failed to get document."
+    
+    # Format document
+    output_parts = []
+    
+    # Header
+    if result.title:
+        output_parts.append(f"# {result.title}")
+    
+    # Metadata
+    metadata_parts = []
+    if result.slug:
+        metadata_parts.append(f"**Slug:** {result.slug}")
+    if result.type:
+        metadata_parts.append(f"**Type:** {result.type}")
+    if result.source_type:
+        metadata_parts.append(f"**Source:** {result.source_type}")
+    if result.path:
+        metadata_parts.append(f"**Path:** {result.path}")
+    if result.doc_id:
+        metadata_parts.append(f"**Doc ID:** {result.doc_id}")
+    
+    if metadata_parts:
+        output_parts.append("\n" + " | ".join(metadata_parts) + "\n")
+    
+    # Content
+    if result.content:
+        output_parts.append("---\n")
+        output_parts.append(result.content)
+    
     return "\n".join(output_parts)
 
 

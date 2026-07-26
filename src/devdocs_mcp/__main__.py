@@ -175,6 +175,16 @@ def main():
         help="Documentation slug (e.g., javascript, python)",
     )
     
+    # Get command
+    get_parser = subparsers.add_parser(
+        "get",
+        help="Get full document content by document ID",
+    )
+    get_parser.add_argument(
+        "doc_id",
+        help="Document ID from search results",
+    )
+    
     args = parser.parse_args()
     
     # Set up logging
@@ -202,6 +212,8 @@ def main():
             run_list(args)
         elif args.command == "info":
             run_info(args)
+        elif args.command == "get":
+            run_get(args)
         else:
             parser.print_help()
             sys.exit(1)
@@ -324,10 +336,13 @@ def run_query(args):
     
     for i, r in enumerate(result.results, 1):
         logger.info("%d. [%s] (%s) - Score: %.3f", i, r['title'], r['slug'], r['score'])
+        if r.get('id'):
+            logger.info("   Doc ID: %s", r['id'])
         if r.get('path'):
             logger.info("   Path: %s", r['path'])
         preview = r.get('content', '')[:200].replace('\n', ' ')
-        logger.info("   %s...\n", preview)
+        logger.info("   %s...", preview)
+        logger.info("   → Use: devdocs-mcp get \"%s\"\n", r.get('id', ''))
 
 
 def run_add(args):
@@ -639,6 +654,54 @@ def run_info(args):
         logger.info("Content:    %.1f KB", result.content_size_kb)
     
     logger.info("")
+
+
+def run_get(args):
+    """Get full document content by document ID."""
+    from .config import get_config
+    from .operations import get_document_impl
+    
+    logger = logging.getLogger(__name__)
+    config = get_config()
+    
+    # Use shared implementation
+    result = get_document_impl(config, args.doc_id)
+    
+    # Format for CLI
+    if not result.success:
+        logger.error(result.error or f"Failed to get document '{args.doc_id}'.")
+        sys.exit(1)
+    
+    # Print document
+    print("=" * 80)
+    if result.title:
+        print(f"# {result.title}")
+        print()
+    
+    # Metadata
+    if result.slug:
+        print(f"**Slug:** {result.slug}")
+    if result.type:
+        print(f"**Type:** {result.type}")
+    if result.source_type:
+        print(f"**Source:** {result.source_type}")
+    if result.path:
+        print(f"**Path:** {result.path}")
+    if result.doc_id:
+        print(f"**Doc ID:** {result.doc_id}")
+    
+    print()
+    print("-" * 80)
+    print()
+    
+    # Content
+    if result.content:
+        print(result.content)
+    else:
+        print("(No content available)")
+    
+    print()
+    print("=" * 80)
 
 
 if __name__ == "__main__":

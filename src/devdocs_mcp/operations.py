@@ -83,6 +83,20 @@ class DocInfoResult:
     error: str | None = None
 
 
+@dataclass
+class GetDocumentResult:
+    """Result of a get_document operation."""
+    success: bool
+    doc_id: str | None = None
+    slug: str | None = None
+    title: str | None = None
+    content: str | None = None
+    type: str | None = None
+    path: str | None = None
+    source_type: str | None = None
+    error: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Reindex operation
 # ---------------------------------------------------------------------------
@@ -369,6 +383,61 @@ def search_docs_impl(
         total_found=len(results),
         filtered_by={"slugs": slugs, "source_type": source_type},
     )
+
+
+# ---------------------------------------------------------------------------
+# Get document operation
+# ---------------------------------------------------------------------------
+
+def get_document_impl(
+    config: Config,
+    doc_id: str,
+) -> GetDocumentResult:
+    """Get full document content by document ID.
+    
+    Args:
+        config: Configuration object
+        doc_id: Document ID from search results
+        
+    Returns:
+        GetDocumentResult with document content
+    """
+    from .embedder import get_document_by_id
+    import sqlite3
+    
+    # Check if database exists
+    if not config.metadata_db_path.exists():
+        return GetDocumentResult(
+            success=False,
+            error="No metadata database found. Please index documentation first.",
+        )
+    
+    try:
+        with sqlite3.connect(str(config.metadata_db_path)) as conn:
+            doc = get_document_by_id(conn, doc_id)
+            
+            if not doc:
+                return GetDocumentResult(
+                    success=False,
+                    error=f"Document '{doc_id}' not found in index.",
+                )
+            
+            return GetDocumentResult(
+                success=True,
+                doc_id=doc.get("id"),
+                slug=doc.get("slug"),
+                title=doc.get("title"),
+                content=doc.get("content"),
+                type=doc.get("type"),
+                path=doc.get("path"),
+                source_type=doc.get("source_type"),
+            )
+    except Exception as e:
+        logger.error("Failed to get document: %s", e)
+        return GetDocumentResult(
+            success=False,
+            error=f"Failed to get document: {e}",
+        )
 
 
 # ---------------------------------------------------------------------------
