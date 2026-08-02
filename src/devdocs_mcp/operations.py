@@ -651,6 +651,90 @@ def add_web_source_impl(
 
 
 # ---------------------------------------------------------------------------
+# Remove doc operation
+# ---------------------------------------------------------------------------
+
+def remove_doc_impl(
+    config: Config,
+    slug: str,
+) -> SourceOperationResult:
+    """Remove documentation identified by slug, regardless of source type.
+    
+    Detects which source (devdocs, local, web) the slug belongs to and
+    delegates to that source's handler. Also removes any indexed
+    embeddings/metadata for the slug from the search index.
+    
+    Args:
+        config: Configuration object
+        slug: Documentation slug to remove
+        
+    Returns:
+        SourceOperationResult with removal status
+    """
+    from .sources import SourceType, detect_source_type, get_source_handler
+
+    source_type = detect_source_type(config, slug)
+    if not source_type:
+        return SourceOperationResult(
+            success=False,
+            source_type=SourceType.DEVDOCS,
+            slugs=[slug],
+            errors={slug: f"Documentation '{slug}' not found."},
+            metadata={},
+        )
+
+    handler = get_source_handler(source_type)
+    result = handler.remove_source(config, slug=slug)
+
+    if result.success:
+        result.metadata["removed_from_index"] = _remove_slug_from_index(config, slug)
+
+    return result
+
+
+def _remove_slug_from_index(config: Config, slug: str) -> int:
+    """Remove all indexed documents/embeddings for a slug.
+    
+    Safe to call even if no index exists yet or ML dependencies aren't
+    installed - in that case it's a no-op.
+    
+    Args:
+        config: Configuration object
+        slug: Documentation slug whose index entries should be removed
+        
+    Returns:
+        Number of documents removed from the index
+    """
+    if not config.metadata_db_path.exists():
+        return 0
+
+    from .faiss_index import _ML_DEPS_OK
+    if not _ML_DEPS_OK:
+        logger.warning("ML dependencies not installed; skipping index cleanup for '%s'", slug)
+        return 0
+
+    import sqlite3
+    from .embedder import get_documents_by_slug
+    from .faiss_index import EmbeddingIndex
+
+    with sqlite3.connect(str(config.metadata_db_path)) as db:
+        existing_docs = get_documents_by_slug(db, slug)
+
+    if not existing_docs:
+        return 0
+
+    doc_ids_to_delete = [doc["id"] for doc in existing_docs]
+
+    idx = EmbeddingIndex(config.embeddings_dir, config.metadata_db_path)
+    idx.load_or_create_index()
+    removed = idx.remove_documents(doc_ids_to_delete)
+    idx.save_index()
+
+    logger.info("Removed %d indexed document(s) for '%s'", removed, slug)
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # Doc info operation
 # ---------------------------------------------------------------------------
 

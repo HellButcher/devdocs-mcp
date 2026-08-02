@@ -585,12 +585,20 @@ def get_faiss_ids_for_doc_ids(db: sqlite3.Connection, doc_ids: list[str]) -> dic
     if not doc_ids:
         return {}
     
-    placeholders = ','.join('?' * len(doc_ids))
-    cursor = db.execute(
-        f"SELECT doc_id, id FROM documents WHERE doc_id IN ({placeholders})",
-        doc_ids
-    )
-    return {row[0]: row[1] for row in cursor.fetchall()}
+    # SQLite has a limit on the number of host parameters per statement
+    # (SQLITE_MAX_VARIABLE_NUMBER, historically 999, up to ~32766 on newer
+    # builds). Chunk large lists to stay well within that limit.
+    batch_size = 900
+    result: dict[str, int] = {}
+    for i in range(0, len(doc_ids), batch_size):
+        batch = doc_ids[i:i + batch_size]
+        placeholders = ','.join('?' * len(batch))
+        cursor = db.execute(
+            f"SELECT doc_id, id FROM documents WHERE doc_id IN ({placeholders})",
+            batch
+        )
+        result.update({row[0]: row[1] for row in cursor.fetchall()})
+    return result
 
 
 def get_all_doc_ids(db: sqlite3.Connection) -> list[str]:
@@ -697,10 +705,15 @@ def delete_documents_by_ids(db: sqlite3.Connection, doc_ids: list[str]) -> int:
     if not doc_ids:
         return 0
     
-    placeholders = ','.join('?' * len(doc_ids))
-    cursor = db.execute(
-        f"DELETE FROM documents WHERE doc_id IN ({placeholders})",
-        doc_ids
-    )
+    batch_size = 900
+    deleted = 0
+    for i in range(0, len(doc_ids), batch_size):
+        batch = doc_ids[i:i + batch_size]
+        placeholders = ','.join('?' * len(batch))
+        cursor = db.execute(
+            f"DELETE FROM documents WHERE doc_id IN ({placeholders})",
+            batch
+        )
+        deleted += cursor.rowcount
     db.commit()
-    return cursor.rowcount
+    return deleted

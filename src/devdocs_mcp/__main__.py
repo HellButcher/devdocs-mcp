@@ -95,7 +95,7 @@ def main():
     )
     local_parser.add_argument(
         "--slug",
-        help="Unique identifier for this web source",
+        help="Unique identifier for this local source",
     )
     
     # Add -> web
@@ -126,6 +126,16 @@ def main():
         "--pattern",
         default=r".*\.html?$",
         help=r"Regex pattern for URLs to fetch (default: .*\.html?$)",
+    )
+    
+    # Remove command
+    remove_parser = subparsers.add_parser(
+        "remove",
+        help="Remove documentation by slug, regardless of source type",
+    )
+    remove_parser.add_argument(
+        "slug",
+        help="Documentation slug to remove (e.g. 'async')",
     )
     
     # Reindex command
@@ -205,6 +215,8 @@ def main():
             run_query(args)
         elif args.command == "add":
             run_add(args)
+        elif args.command == "remove":
+            run_remove(args)
         elif args.command == "reindex":
             run_reindex(args)
         elif args.command == "list":
@@ -419,6 +431,27 @@ def run_add(args):
         
         logger.info("  Downloaded %d HTML files", num_files)
         logger.info("Run 'devdocs-mcp reindex' to index them.")
+
+
+def run_remove(args):
+    """Remove documentation by slug, regardless of source type."""
+    from .config import get_config
+    from .operations import remove_doc_impl
+    
+    logger = logging.getLogger(__name__)
+    config = get_config()
+    
+    result = remove_doc_impl(config, args.slug)
+    
+    if not result.success:
+        error_msg = list(result.errors.values())[0] if result.errors else f"Failed to remove '{args.slug}'."
+        logger.error(error_msg)
+        sys.exit(1)
+    
+    logger.info("✓ Removed '%s'", args.slug)
+    removed_count = result.metadata.get("removed_from_index", 0)
+    if removed_count:
+        logger.info("Removed %d indexed document(s) from the search index.", removed_count)
 
 
 def run_reindex(args):

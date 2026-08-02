@@ -29,7 +29,6 @@ from .config import (  # noqa: E402
     POPULAR_DOCS,
     Config,
     DevdocsSource,
-    LocalSource,
     get_config,
 )
 from .catalog import (  # noqa: E402
@@ -44,8 +43,6 @@ from .download import (  # noqa: E402
     download_docs_batch,
     get_doc_index,
     get_doc_pages,
-    list_downloaded_docs,
-    remove_doc as _remove_doc_impl,
 )
 from .embedder import (  # noqa: E402
     SearchDocument,
@@ -462,28 +459,25 @@ def rebuild_index(clean: bool = False, slugs: list[str] | None = None) -> str:
 
 @mcp.tool()
 def remove_doc(slug: str) -> str:
-    """Remove a downloaded documentation bundle.
+    """Remove documentation by slug, regardless of source type.
+
+    Works for downloaded devdocs.io bundles, local sources, and web sources.
 
     Args:
         slug: Documentation slug to remove (e.g. 'async')
     """
     config = get_config()
 
-    if slug not in list_downloaded_docs(config.docs_dir):
-        return f"Documentation '{slug}' is not downloaded."
+    from .operations import remove_doc_impl
+    result = remove_doc_impl(config, slug)
 
-    # Remove from downloads
-    success = _remove_doc_impl(slug, config.docs_dir)
+    if not result.success:
+        return list(result.errors.values())[0] if result.errors else f"Failed to remove '{slug}'."
 
-    # Update config
-    config.downloaded_slugs.discard(slug)
-    config.save()
-
-    # Note: Rebuild index to clean up embeddings
-    return (
-        f"Removed '{slug}'.\n\n"
-        "Run 'rebuild_index' to update the embedding index."
-    )
+    removed_count = result.metadata.get("removed_from_index", 0)
+    if removed_count:
+        return f"Removed '{slug}' and {removed_count} indexed document(s) from the search index."
+    return f"Removed '{slug}'."
 
 
 @mcp.tool()
@@ -565,28 +559,6 @@ def add_web_source(
         f"- Slug: {slug}\n"
         f"Run 'rebuild_index' to create embeddings for these docs."
     )
-
-
-@mcp.tool()
-def remove_local_source(path: str) -> str:
-    """Remove a local documentation source.
-
-    Args:
-        path: The absolute filesystem path of the source to remove
-    """
-    config = get_config()
-
-    original_count = len(config.sources)
-    config.sources = [
-        s for s in config.sources
-        if not (isinstance(s, LocalSource) and s.path == path)
-    ]
-
-    if len(config.sources) >= original_count:
-        return f"No local source found at '{path}'."
-
-    config.save()
-    return f"Removed local source '{path}'. Run 'rebuild_index' to update embeddings."
 
 
 @mcp.tool()

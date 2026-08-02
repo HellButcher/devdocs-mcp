@@ -85,6 +85,19 @@ class SourceHandler(ABC):
         pass
     
     @abstractmethod
+    def remove_source(self, config: Any, **kwargs) -> SourceOperationResult:
+        """Remove/uninstall documentation from this source.
+        
+        Args:
+            config: Configuration object
+            **kwargs: Source-specific parameters (e.g. slug, path)
+            
+        Returns:
+            SourceOperationResult with operation details
+        """
+        pass
+    
+    @abstractmethod
     def extract_documents(self, config: Any, slug: str, progress_callback: Optional[Callable] = None) -> list[Any]:
         """Extract SearchDocument objects from this source.
         
@@ -245,6 +258,46 @@ class DevDocsSourceHandler(SourceHandler):
     def is_available(self, config: Any, slug: str) -> bool:
         """Check if a devdocs.io doc is downloaded."""
         return slug in config.downloaded_slugs
+    
+    def remove_source(self, config: Any, **kwargs) -> SourceOperationResult:
+        """Remove a downloaded documentation bundle.
+        
+        Expected kwargs:
+            slug: str - documentation slug to remove
+        """
+        from .download import list_downloaded_docs, remove_doc
+
+        slug = kwargs.get("slug")
+        if not slug:
+            return SourceOperationResult(
+                success=False,
+                source_type=SourceType.DEVDOCS,
+                slugs=[],
+                errors={"": "No slug provided"},
+                metadata={},
+            )
+
+        if slug not in list_downloaded_docs(config.docs_dir):
+            return SourceOperationResult(
+                success=False,
+                source_type=SourceType.DEVDOCS,
+                slugs=[slug],
+                errors={slug: f"Documentation '{slug}' is not downloaded."},
+                metadata={},
+            )
+
+        remove_doc(slug, config.docs_dir)
+
+        config.downloaded_slugs.discard(slug)
+        config.save()
+
+        return SourceOperationResult(
+            success=True,
+            source_type=SourceType.DEVDOCS,
+            slugs=[slug],
+            errors={},
+            metadata={},
+        )
 
 
 class LocalSourceHandler(SourceHandler):
@@ -440,6 +493,51 @@ class LocalSourceHandler(SourceHandler):
         """Local sources are always available (no download needed)."""
         source = self.get_source_by_slug(config, slug)
         return source is not None and Path(source.path).exists()
+    
+    def remove_source(self, config: Any, **kwargs) -> SourceOperationResult:
+        """Remove a local documentation source.
+        
+        Expected kwargs:
+            slug: str - unique identifier of the local source to remove
+        """
+        slug = kwargs.get("slug")
+        if not slug:
+            return SourceOperationResult(
+                success=False,
+                source_type=SourceType.LOCAL,
+                slugs=[],
+                errors={"": "No slug provided"},
+                metadata={},
+            )
+
+        original_count = len(config.sources)
+        removed_paths = [
+            s.path for s in config.sources
+            if isinstance(s, LocalSource) and s.slug == slug
+        ]
+        config.sources = [
+            s for s in config.sources
+            if not (isinstance(s, LocalSource) and s.slug == slug)
+        ]
+
+        if len(config.sources) >= original_count:
+            return SourceOperationResult(
+                success=False,
+                source_type=SourceType.LOCAL,
+                slugs=[slug],
+                errors={slug: f"No local source found with slug '{slug}'."},
+                metadata={},
+            )
+
+        config.save()
+
+        return SourceOperationResult(
+            success=True,
+            source_type=SourceType.LOCAL,
+            slugs=[slug],
+            errors={},
+            metadata={"paths": removed_paths},
+        )
 
 
 class WebSourceHandler(SourceHandler):
@@ -783,6 +881,52 @@ class WebSourceHandler(SourceHandler):
         """Check if web docs are cached."""
         source = self.get_source_by_slug(config, slug)
         return source is not None and Path(source.cache_path).exists()
+    
+    def remove_source(self, config: Any, **kwargs) -> SourceOperationResult:
+        """Remove a web-fetched documentation source.
+        
+        Expected kwargs:
+            slug: str - unique identifier for the web source to remove
+        """
+        import shutil
+
+        slug = kwargs.get("slug")
+        if not slug:
+            return SourceOperationResult(
+                success=False,
+                source_type=SourceType.WEB,
+                slugs=[],
+                errors={"": "No slug provided"},
+                metadata={},
+            )
+
+        source = self.get_source_by_slug(config, slug)
+        if not source:
+            return SourceOperationResult(
+                success=False,
+                source_type=SourceType.WEB,
+                slugs=[],
+                errors={slug: f"Web source '{slug}' not found."},
+                metadata={},
+            )
+
+        cache_path = Path(source.cache_path)
+        if cache_path.exists():
+            shutil.rmtree(cache_path)
+
+        config.sources = [
+            src for src in config.sources
+            if not (isinstance(src, WebSource) and src.slug == slug)
+        ]
+        config.save()
+
+        return SourceOperationResult(
+            success=True,
+            source_type=SourceType.WEB,
+            slugs=[slug],
+            errors={},
+            metadata={"cache_path": str(cache_path)},
+        )
 
 
 # Registry of source handlers
