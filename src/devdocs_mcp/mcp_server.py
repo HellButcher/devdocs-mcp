@@ -20,8 +20,7 @@ def _check_ml_deps():
 
 ML_AVAILABLE = _check_ml_deps()
 
-from mcp.server.fastmcp import FastMCP  # noqa: E402
-import httpx  # noqa: E402
+from mcp.server import MCPServer  # noqa: E402
 
 from .config import (  # noqa: E402
     APP_NAME,
@@ -62,7 +61,7 @@ from .embedder import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 # Create MCP server
-mcp = FastMCP(
+mcp = MCPServer(
     APP_NAME,
     instructions="Semantic search over devdocs.io documentation and custom static docs. Download docs from devdocs.io catalog, index them for semantic search, add local HTML doc directories as sources.",
 )

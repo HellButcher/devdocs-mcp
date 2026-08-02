@@ -43,15 +43,21 @@ uv run devdocs-mcp
 
 ### Alternative Installation Methods
 
-Install with uv:
+Install with `uv tool`:
 ```bash
-uv pip install "devdocs-mcp[ml] @ git+https://github.com/HellButcher/devdocs-mcp.git"
+uv tool install "devdocs-mcp[ml] @ git+https://github.com/HellButcher/devdocs-mcp.git"
+
+# Alternative: without ML sependencies (semantic search disabled)
+uv tool install "devdocs-mcp @ git+https://github.com/HellButcher/devdocs-mcp.git"
+
+# and then run
 devdocs-mcp
 ```
 
-Install without ML dependencies (semantic search disabled):
+
+Or directly execute using `uvx`:
 ```bash
-uvx --from "git+https://github.com/HellButcher/devdocs-mcp.git" devdocs-mcp
+uvx --from "devdocs-mcp[ml] @ git+https://github.com/HellButcher/devdocs-mcp.git" devdocs-mcp
 ```
 
 ## Features

@@ -239,7 +239,7 @@ def run_mcp_server(args):
     logger.info("Cache dir:  %s", CACHE_DIR)
     logger.info("Reading from stdin (press CTRL+D to close or CTRL+C to interrupt)")
     
-    # Wrap the FastMCP run to ensure proper signal handling
+    # Wrap the MCPServer run to ensure proper signal handling
     async def run_with_signal_handling():
         """Run server with proper SIGINT/SIGTERM handling."""
         # Get the event loop
