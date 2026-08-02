@@ -41,23 +41,18 @@ uv sync --extra ml
 uv run devdocs-mcp
 ```
 
-### Alternative Installation Methods
+### Install with locked dependency versions
 
-Install with `uv tool`:
+`uvx`/`uv tool install` resolve dependencies fresh and don't use the repo's `uv.lock`. If you want the exact, tested dependency versions instead, clone the repo and use the provided install script, which exports `uv.lock` and installs the tool constrained to it:
+
 ```bash
-uv tool install "devdocs-mcp[ml] @ git+https://github.com/HellButcher/devdocs-mcp.git"
+git clone https://github.com/HellButcher/devdocs-mcp.git
+cd devdocs-mcp
+./install.sh            # with ML dependencies (semantic search)
+./install.sh --no-ml    # without ML dependencies
 
-# Alternative: without ML sependencies (semantic search disabled)
-uv tool install "devdocs-mcp @ git+https://github.com/HellButcher/devdocs-mcp.git"
-
-# and then run
+# then just call devdocs-mcp to run it
 devdocs-mcp
-```
-
-
-Or directly execute using `uvx`:
-```bash
-uvx --from "devdocs-mcp[ml] @ git+https://github.com/HellButcher/devdocs-mcp.git" devdocs-mcp
 ```
 
 ## Features
