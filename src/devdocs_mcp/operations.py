@@ -585,7 +585,7 @@ def download_docs_impl(
 def add_local_source_impl(
     config: Config,
     path: str,
-    slug_prefix: str = "",
+    slug: str,
 ) -> SourceOperationResult:
     """Add a local directory as a documentation source.
     
@@ -602,7 +602,7 @@ def add_local_source_impl(
     from .sources import SourceType, get_source_handler
     
     handler = get_source_handler(SourceType.LOCAL)
-    return handler.add_source(config, path=path, slug_prefix=slug_prefix)
+    return handler.add_source(config, path=path, slug=slug)
 
 
 # ---------------------------------------------------------------------------

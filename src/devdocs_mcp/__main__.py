@@ -62,7 +62,7 @@ def main():
     )
     query_parser.add_argument(
         "--source",
-        choices=["devdocs", "local"],
+        choices=["devdocs", "local", "web"],
         help="Filter by source type",
     )
     
@@ -94,9 +94,8 @@ def main():
         help="Path to local HTML directory",
     )
     local_parser.add_argument(
-        "--prefix",
-        default="",
-        help="Slug prefix for generated entries",
+        "--slug",
+        help="Unique identifier for this web source",
     )
     
     # Add -> web
@@ -379,7 +378,7 @@ def run_add(args):
         
     elif args.add_type == "local":
         # Use shared implementation
-        result = add_local_source_impl(config, args.path, args.prefix or "")
+        result = add_local_source_impl(config, args.path, args.slug)
         
         # Format for CLI
         if not result.success:

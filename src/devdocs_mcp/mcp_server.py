@@ -487,20 +487,20 @@ def remove_doc(slug: str) -> str:
 
 
 @mcp.tool()
-def add_local_source(path: str, slug_prefix: str = "") -> str:
+def add_local_source(path: str, slug: str) -> str:
     """Add a local directory as a documentation source.
 
     The directory should contain HTML files that will be indexed for search.
 
     Args:
         path: Absolute filesystem path to the docs directory
-        slug_prefix: Optional prefix for generated slugs (e.g. 'mylib/')
+        slug: Unique identifier for this local source
     """
     config = get_config()
     
     # Use shared implementation
     from .operations import add_local_source_impl
-    result = add_local_source_impl(config, path, slug_prefix)
+    result = add_local_source_impl(config, path, slug)
     
     # Format for MCP (string output)
     if not result.success:

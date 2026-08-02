@@ -328,9 +328,9 @@ class LocalSourceHandler(SourceHandler):
             )
         
         # Remove existing local source with same path (deduplication)
-        config.local_sources = [
-            src for src in config.local_sources
-            if Path(src.path).resolve() != abs_path
+        config.sources = [
+            src for src in config.sources
+            if not (isinstance(src, LocalSource) and Path(src.path).resolve() == abs_path)
         ]
         
         # Create LocalSource
@@ -341,7 +341,7 @@ class LocalSourceHandler(SourceHandler):
         )
         
         # Add to config
-        config.local_sources.append(local_src)
+        config.sources.append(local_src)
         config.save()
         
         return SourceOperationResult(
