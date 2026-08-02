@@ -18,6 +18,14 @@ from devdocs_mcp.embedder import extract_text_from_local, scan_local_directory
 logger = logging.getLogger(__name__)
 
 
+def _dir_size_mb(path: Path) -> float:
+    """Compute the total size in MB of all files under a directory tree."""
+    if not path.exists():
+        return 0.0
+    total_bytes = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    return total_bytes / (1024 * 1024)
+
+
 class SourceType(Enum):
     """Types of documentation sources."""
     DEVDOCS = "devdocs"
@@ -168,7 +176,8 @@ class DevDocsSourceHandler(SourceHandler):
         
         for slug in slugs:
             try:
-                size_mb = download_doc(slug, config.docs_dir)
+                download_doc(slug, config.docs_dir)
+                size_mb = _dir_size_mb(config.docs_dir / slug)
                 downloaded.append(slug)
                 total_size_mb += size_mb
                 logger.info(f"Downloaded {slug} ({size_mb:.1f} MB)")
