@@ -198,7 +198,10 @@ def search_docs(
     Args:
         query: Natural language search query (e.g. "how to make HTTP requests")
         top_k: Number of results to return (default: 10)
-        min_score: Minimum relevance score 0.0-1.0 (default: 0.3)
+        min_score: Minimum vector-similarity score 0.0-1.0 (default: 0.3).
+            Applies to the semantic/vector search leg only — keyword/BM25
+            matches (e.g. exact title matches for bare-word queries) can
+            still surface in results even with low semantic similarity.
         slugs: Optional list of doc slugs to filter by (e.g. ['javascript', 'python'])
         source_type: Optional source type filter ('devdocs' or 'local')
     """

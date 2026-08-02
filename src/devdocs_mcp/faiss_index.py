@@ -232,7 +232,11 @@ class EmbeddingIndex:
         return deleted_count
 
     def search(
-        self, query: str, top_k: int = 10, min_score: float = 0.0
+        self,
+        query: str,
+        top_k: int = 10,
+        min_score: float = 0.0,
+        allowed_faiss_ids: list[int] | None = None,
     ) -> list[dict[str, Any]]:
         """Search for documents similar to the query.
         
@@ -242,16 +246,25 @@ class EmbeddingIndex:
             query: Search query string
             top_k: Maximum number of results
             min_score: Minimum similarity score threshold
+            allowed_faiss_ids: If provided, restrict the search to only these
+                FAISS ids (via an IDSelector) *before* ranking. This is
+                important for filtered searches (e.g. by slug): taking the
+                globally-ranked top-k and filtering afterwards can silently
+                drop every relevant result when the filtered subset is a
+                small fraction of a much larger combined index.
 
         Returns: List of {doc_id, score}
         """
+        import faiss
         import numpy as np
         from .embedder import get_document_by_faiss_id, count_documents
 
-        doc_count = 0
-        with sqlite3.connect(str(self.metadata_db_path)) as db:
-            doc_count = count_documents(db)
-        
+        if allowed_faiss_ids is not None:
+            doc_count = len(allowed_faiss_ids)
+        else:
+            with sqlite3.connect(str(self.metadata_db_path)) as db:
+                doc_count = count_documents(db)
+
         if doc_count == 0:
             return []
 
@@ -259,10 +272,19 @@ class EmbeddingIndex:
         query_embedding = self.model.encode(query, normalize_embeddings=True)
         query_vec = np.array([query_embedding], dtype="float32")
 
-        # Search FAISS index
-        scores, faiss_ids = self.faiss_index.search(
-            query_vec, min(top_k, doc_count)
-        )
+        # Search FAISS index, optionally restricted to a subset of ids
+        if allowed_faiss_ids is not None:
+            selector = faiss.IDSelectorBatch(
+                np.array(allowed_faiss_ids, dtype=np.int64)
+            )
+            params = faiss.SearchParameters(sel=selector)
+            scores, faiss_ids = self.faiss_index.search(
+                query_vec, min(top_k, doc_count), params=params
+            )
+        else:
+            scores, faiss_ids = self.faiss_index.search(
+                query_vec, min(top_k, doc_count)
+            )
 
         results = []
         with sqlite3.connect(str(self.metadata_db_path)) as db:

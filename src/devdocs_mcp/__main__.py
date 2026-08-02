@@ -207,7 +207,23 @@ def main():
     # Default to mcp command if none specified
     if not args.command:
         args.command = "mcp"
-    
+
+    # Ensure the metadata DB schema (including the FTS5 keyword-search index
+    # and its sync triggers) exists once per process startup, rather than on
+    # every search query. init_metadata_db is idempotent (CREATE TABLE/TRIGGER
+    # IF NOT EXISTS) and backfills the FTS index for pre-existing databases.
+    try:
+        from .config import get_config
+        from .embedder import init_metadata_db
+
+        init_metadata_db(get_config().metadata_db_path).close()
+    except Exception:
+        # Not fatal — semantic search still works without the FTS5 keyword
+        # index, but warn since this otherwise silently degrades keyword
+        # search quality with no other visible signal (e.g. FTS5 not
+        # compiled into the local sqlite3 build).
+        logger.warning("Metadata DB / FTS5 index initialization failed at startup", exc_info=True)
+
     try:
         if args.command == "mcp":
             run_mcp_server(args)

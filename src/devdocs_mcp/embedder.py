@@ -537,9 +537,69 @@ def init_metadata_db(db_path: Path) -> sqlite3.Connection:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_docs_source ON documents(source_type)
     """)
-    
+
+    _init_fts(db)
+
     db.commit()
     return db
+
+
+def _init_fts(db: sqlite3.Connection) -> None:
+    """Create the FTS5 full-text index and keep-in-sync triggers.
+
+    Uses an "external content" FTS5 table backed by the `documents` table
+    (content_rowid='id') so `documents_fts` never duplicates storage and
+    stays automatically in sync via triggers on INSERT/UPDATE/DELETE of
+    `documents` — no changes needed to upsert_documents/delete_documents_by_ids.
+
+    This provides a lexical/keyword search path (BM25) to complement the
+    dense vector search, which struggles with short/bare keyword queries
+    (e.g. a single word like "Unstable") that don't carry enough semantic
+    context for the embedding model to match well.
+    """
+    db.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            title, content, content='documents', content_rowid='id'
+        )
+    """)
+
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts(rowid, title, content)
+            VALUES (new.id, new.title, new.content);
+        END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, title, content)
+            VALUES ('delete', old.id, old.title, old.content);
+        END
+    """)
+    db.execute("""
+        CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, title, content)
+            VALUES ('delete', old.id, old.title, old.content);
+            INSERT INTO documents_fts(rowid, title, content)
+            VALUES (new.id, new.title, new.content);
+        END
+    """)
+
+    # Backfill for pre-existing databases that had documents inserted
+    # before the FTS table/triggers existed.
+    #
+    # NOTE: `documents_fts` is an "external content" FTS5 table, so a plain
+    # (non-MATCH) `SELECT COUNT(*) FROM documents_fts` is answered by proxy
+    # from the `documents` content table itself — it does NOT reflect
+    # whether the FTS5 index (segments) actually contain any data. The
+    # `documents_fts_docsize` shadow table is the correct way to check
+    # whether the index has been populated.
+    doc_count = db.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    indexed_count = db.execute("SELECT COUNT(*) FROM documents_fts_docsize").fetchone()[0]
+    if doc_count > 0 and indexed_count == 0:
+        logger.info("Building full-text index for %d existing documents...", doc_count)
+        # The 'rebuild' command is FTS5's documented way to (re)populate an
+        # external-content table's index from its content table.
+        db.execute("INSERT INTO documents_fts(documents_fts) VALUES('rebuild')")
 
 
 def upsert_documents(db: sqlite3.Connection, docs: list[SearchDocument]) -> int:
@@ -690,6 +750,166 @@ def count_documents(db: sqlite3.Connection) -> int:
     """Count total documents."""
     row = db.execute("SELECT COUNT(*) FROM documents").fetchone()
     return row[0] if row else 0
+
+
+def get_faiss_ids_by_filter(
+    db: sqlite3.Connection,
+    slugs: list[str] | None = None,
+    source_type: str | None = None,
+) -> list[int] | None:
+    """Get FAISS IDs (documents.id) matching slug/source_type filters.
+
+    Used to scope vector search to a subset of the index (via a FAISS
+    IDSelector) *before* ranking, instead of taking the globally-ranked
+    top-k and filtering afterwards. Filtering afterwards can silently
+    drop every relevant hit when the requested slug is a small fraction
+    of a much larger combined index (e.g. searching a single doc's slug
+    within an index containing hundreds of thousands of chunks from many
+    docs) — relevant chunks simply never make it into the initial
+    unfiltered top-k candidate pool.
+
+    Args:
+        db: Database connection
+        slugs: Optional list of slugs to restrict to
+        source_type: Optional source_type to restrict to
+
+    Returns:
+        List of FAISS ids to restrict search to, or None if no filter
+        was requested (meaning: search the whole index).
+    """
+    if not slugs and not source_type:
+        return None
+
+    query = "SELECT id FROM documents WHERE 1=1"
+    params: list[Any] = []
+
+    if slugs:
+        placeholders = ",".join("?" * len(slugs))
+        query += f" AND slug IN ({placeholders})"
+        params.extend(slugs)
+
+    if source_type:
+        query += " AND source_type = ?"
+        params.append(source_type)
+
+    cursor = db.execute(query, params)
+    return [row[0] for row in cursor.fetchall()]
+
+
+def keyword_search(
+    db: sqlite3.Connection,
+    query: str,
+    slugs: list[str] | None = None,
+    source_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Lexical/keyword search over title+content using SQLite FTS5 (BM25).
+
+    Complements the dense vector search: bare keyword or exact-term queries
+    (e.g. a single word like "Unstable") often don't carry enough semantic
+    context for an embedding model to score well, even when the term
+    appears verbatim in a highly-relevant document. FTS5's BM25 ranking
+    reliably surfaces exact/near-exact term matches that semantic search
+    can miss.
+
+    Args:
+        db: Database connection
+        query: Search query (raw user text; sanitized into an FTS5 query)
+        slugs: Optional list of slugs to restrict to
+        source_type: Optional source_type to restrict to
+        limit: Maximum number of results
+
+    Returns:
+        List of dicts with doc_id, faiss_id, and the raw BM25 score,
+        ordered best-match-first (BM25 is more negative for better
+        matches). Callers combine this ranked list with the semantic
+        search's ranked list via Reciprocal Rank Fusion (see
+        operations.search_docs_impl) rather than trying to compare BM25
+        and cosine-similarity magnitudes directly — the two scores live on
+        unrelated scales and BM25 magnitude isn't reliably comparable
+        across corpora/queries, so rank position is the more robust signal
+        to fuse on.
+    """
+    fts_query = _build_fts_query(query)
+    if not fts_query:
+        return []
+
+    sql = """
+        SELECT d.id, d.doc_id, bm25(documents_fts, 10.0, 1.0) AS rank
+        FROM documents_fts
+        JOIN documents d ON d.id = documents_fts.rowid
+        WHERE documents_fts MATCH ?
+    """
+    # Column weights: title=10.0, content=1.0. A term matching the *title*
+    # (e.g. "Unstable" in "The Rust Unstable Book") is a far stronger
+    # relevance signal than the same term merely appearing once inside a
+    # large content chunk (e.g. a code sample using the word "unstable"),
+    # so it's weighted much higher to rank the on-topic doc first.
+    params: list[Any] = [fts_query]
+
+    if slugs:
+        placeholders = ",".join("?" * len(slugs))
+        sql += f" AND d.slug IN ({placeholders})"
+        params.extend(slugs)
+    if source_type:
+        sql += " AND d.source_type = ?"
+        params.append(source_type)
+
+    # bm25() returns negative values; lower (more negative) is a better match
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+
+    try:
+        cursor = db.execute(sql, params)
+        rows = cursor.fetchall()
+    except sqlite3.OperationalError as e:
+        logger.debug("FTS5 keyword search failed for query %r: %s", query, e)
+        return []
+
+    results = []
+    for faiss_id, doc_id, rank in rows:
+        results.append({"faiss_id": faiss_id, "doc_id": doc_id, "bm25": rank})
+
+    return results
+
+
+# Common English stopwords excluded from FTS queries. Bare/short-word
+# queries like "Unstable" are exactly the case keyword_search exists to
+# help with, but including high-frequency function words (e.g. "how",
+# "to", "a") in an OR-joined FTS query would make it "match" a huge
+# fraction of any corpus and pollute lexical ranking for ordinary
+# natural-language queries (e.g. "how to make HTTP requests").
+_FTS_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "of", "in", "on", "at",
+    "to", "for", "with", "without", "is", "are", "was", "were", "be",
+    "been", "being", "do", "does", "did", "how", "what", "when", "where",
+    "why", "which", "who", "whom", "this", "that", "these", "those",
+    "it", "its", "as", "by", "from", "into", "about", "can", "could",
+    "should", "would", "will", "shall", "may", "might", "must", "not",
+    "you", "your", "i", "me", "my", "we", "our", "they", "their",
+})
+
+
+def _build_fts_query(query: str) -> str:
+    """Sanitize free-form user text into a safe FTS5 MATCH query.
+
+    Wraps each significant (non-stopword) token as a quoted phrase and
+    joins with OR so that any matching token contributes to relevance
+    ranking, while avoiding FTS5 query syntax errors from special
+    characters in the raw user input. Stopwords are dropped so that
+    ordinary natural-language queries aren't diluted into effectively
+    matching most of the corpus.
+
+    Returns "" if there are no significant tokens (e.g. the query is only
+    stopwords), signaling callers to skip lexical search for this query.
+    """
+    tokens = re.findall(r"[\w][\w'-]*", query)
+    significant = [t for t in tokens if t.lower() not in _FTS_STOPWORDS]
+    if not significant:
+        return ""
+    # Escape embedded double quotes, then quote each token as an FTS5 phrase
+    quoted = ['"{}"'.format(t.replace('"', '""')) for t in significant]
+    return " OR ".join(quoted)
 
 
 def delete_documents_by_ids(db: sqlite3.Connection, doc_ids: list[str]) -> int:

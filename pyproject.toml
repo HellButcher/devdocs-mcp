@@ -12,7 +12,11 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
-    "faiss-cpu>=1.7.0",
+    # >=1.7.4 required: faiss_index.EmbeddingIndex.search() uses
+    # Index.search(..., params=faiss.SearchParameters(sel=IDSelectorBatch(...)))
+    # to scope filtered searches (by slug/source_type) before ranking,
+    # which needs the generic search-with-parameters support added in 1.7.4.
+    "faiss-cpu>=1.7.4",
     "sentence-transformers>=2.2.0",
     "numpy>=1.24.0",
 ]

@@ -293,7 +293,7 @@ ml = [
 
 [package.metadata]
 requires-dist = [
-    { name = "faiss-cpu", marker = "extra == 'ml'", specifier = ">=1.7.0" },
+    { name = "faiss-cpu", marker = "extra == 'ml'", specifier = ">=1.7.4" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "lxml", specifier = ">=5.0.0" },
     { name = "mcp", specifier = ">=2,<3" },

@@ -301,6 +301,53 @@ def rebuild_index_impl(
 # Search operation
 # ---------------------------------------------------------------------------
 
+# Reciprocal Rank Fusion constant. 60 is the standard value used by Azure AI
+# Search's hybrid search scoring and other hybrid FTS5+embedding
+# implementations; it flattens the difference between adjacent top ranks
+# while still favoring higher ranks. See _reciprocal_rank_fusion below.
+_RRF_K = 60
+
+
+def _reciprocal_rank_fusion(
+    ranked_doc_id_lists: list[list[str]], k: int = _RRF_K
+) -> dict[str, float]:
+    """Fuse multiple ranked doc_id lists into one score per doc via RRF.
+
+    Reciprocal Rank Fusion: RRF(d) = sum, over each ranked list L that
+    contains d, of 1/(k + rank_L(d)) (rank is 1-indexed; best match first).
+
+    This is the standard technique for combining rankings from
+    heterogeneous retrieval methods (e.g. BM25 keyword search + dense
+    vector/embedding search) whose raw scores live on unrelated,
+    corpus-dependent scales and can't be reliably compared or calibrated
+    against each other directly. Used by e.g. Azure AI Search's hybrid
+    search scoring and other hybrid FTS5+embedding implementations:
+    - https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking
+    - https://dev.to/tofutim/how-we-built-a-hybrid-fts5-embedding-search-for-code-and-why-you-need-both-4ec2
+
+    k=60 is the constant these implementations converge on; it has the
+    effect of flattening the difference between e.g. rank 1 and rank 2
+    (1/61 vs 1/62) so that top-of-list matches from *any* contributing
+    signal have similar overall influence, while still favoring the
+    highest ranks.
+
+    Args:
+        ranked_doc_id_lists: One or more ranked lists of doc_ids
+            (best match first). Empty lists are ignored.
+        k: RRF constant (default 60, the commonly used value)
+
+    Returns:
+        Dict of doc_id -> fused RRF score (higher is better; not bounded
+        to [0, 1] — see search_docs_impl for how this is normalized into
+        an approximate confidence score for min_score thresholding).
+    """
+    scores: dict[str, float] = {}
+    for doc_ids in ranked_doc_id_lists:
+        for rank, doc_id in enumerate(doc_ids, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
 def search_docs_impl(
     config: Config,
     query: str,
@@ -309,22 +356,47 @@ def search_docs_impl(
     slugs: list[str] | None = None,
     source_type: str | None = None,
 ) -> SearchResult:
-    """Search documentation using semantic similarity.
-    
+    """Search documentation using hybrid semantic + keyword search.
+
     This is the core implementation used by both CLI and MCP.
-    
+
+    Combines dense vector (semantic) search with an FTS5/BM25 keyword
+    search over titles+content, fused via Reciprocal Rank Fusion (RRF —
+    see `_reciprocal_rank_fusion`). This matters for bare keyword queries
+    (e.g. a single word like "Unstable") which often don't carry enough
+    semantic context for the embedding model to score well, even when the
+    term appears verbatim in a highly relevant document/title — the
+    keyword search's BM25 ranking reliably surfaces those, and RRF lets
+    them contribute to the final ranking without having to calibrate BM25
+    scores against cosine similarities (which live on unrelated scales).
+
+    When `slugs`/`source_type` filters are given, the vector search is
+    scoped to just the matching documents *before* ranking (via a FAISS
+    ID selector), rather than taking the globally-ranked top-k and
+    filtering afterwards — the latter can silently drop every relevant
+    result when the filtered subset is a small fraction of a much larger
+    combined index.
+
     Args:
         config: Configuration object
         query: Natural language search query
         top_k: Number of results to return
-        min_score: Minimum relevance score 0.0-1.0
+        min_score: Minimum vector-similarity (cosine) score, 0.0-1.0,
+            applied to the semantic/vector search leg only — so weak
+            dense-vector matches never enter the candidate pool at all.
+            It does not gate the final fused ranking: results found via
+            keyword/BM25 search but with low (or no) semantic similarity
+            can still surface, since a bare keyword like "Unstable" often
+            has weak embedding similarity even to a highly relevant doc.
+            Final result selection is governed by Reciprocal Rank Fusion
+            order (see `_reciprocal_rank_fusion`) plus `top_k`.
         slugs: Optional list of doc slugs to filter by
         source_type: Optional source type filter ('devdocs' or 'local')
         
     Returns:
         SearchResult with search results
     """
-    from .embedder import get_document_by_id
+    from .embedder import get_document_by_id, get_faiss_ids_by_filter, keyword_search
     from .faiss_index import EmbeddingIndex
     import sqlite3
     
@@ -352,11 +424,36 @@ def search_docs_impl(
             filtered_by={},
             error=f"Failed to load embedding index: {e}",
         )
-    
-    # Search
-    results = idx.search(query, top_k=top_k * 3, min_score=min_score)
-    
-    if not results:
+
+    # Schema (including the FTS5 keyword-search index) is initialized once at
+    # process startup via init_metadata_db — use a plain connection here to
+    # avoid repeating that setup/backfill work on every search query.
+    with sqlite3.connect(str(config.metadata_db_path)) as conn:
+        # Scope the vector search to the filtered subset (if any) so
+        # relevant docs in a small slug can't be crowded out by the rest
+        # of a much larger combined index.
+        allowed_faiss_ids = get_faiss_ids_by_filter(conn, slugs=slugs, source_type=source_type)
+
+        # Semantic (dense vector) search, scoped by filter. min_score is
+        # applied here as a vector-similarity threshold (comparable to
+        # Azure AI Search's per-query vector minimum-similarity thresholds)
+        # so weak dense-vector noise never enters the candidate pool.
+        # idx.search() returns results already sorted best-first.
+        semantic_results = idx.search(
+            query, top_k=top_k * 3, min_score=min_score, allowed_faiss_ids=allowed_faiss_ids
+        )
+
+        # Lexical/keyword search (BM25 via FTS5), same scope. Also already
+        # ordered best-first (lowest/most-negative BM25 first).
+        lexical_results = keyword_search(
+            conn, query, slugs=slugs, source_type=source_type, limit=top_k * 3
+        )
+
+    semantic_doc_ids = [r["doc_id"] for r in semantic_results]
+    lexical_doc_ids = [r["doc_id"] for r in lexical_results]
+    ranked_lists = [lst for lst in (semantic_doc_ids, lexical_doc_ids) if lst]
+
+    if not ranked_lists:
         return SearchResult(
             success=True,
             query=query,
@@ -364,36 +461,56 @@ def search_docs_impl(
             total_found=0,
             filtered_by={"slugs": slugs, "source_type": source_type},
         )
-    
-    # Fetch full document content and apply filters
+
+    fused = _reciprocal_rank_fusion(ranked_lists, k=_RRF_K)
+
+    # Normalize into an approximate [0, 1] confidence score purely for
+    # display purposes: a doc ranked #1 by every contributing signal
+    # scores ~1.0. NOTE: min_score is intentionally *not* reapplied here.
+    # min_score was already used above as a real relevance threshold (a
+    # vector-similarity floor) on the semantic leg. Reapplying it here
+    # against the normalized RRF score would make it behave as an
+    # implicit rank-position cutoff whose meaning shifts with top_k (since
+    # each leg's candidate pool size is top_k*3) rather than a stable
+    # quality bar — e.g. the same min_score would cut off a very
+    # different effective rank depending on top_k. Final result selection
+    # is governed by RRF rank order + the top_k truncation below instead.
+    max_possible = len(ranked_lists) * (1.0 / (_RRF_K + 1))
+    merged = {
+        doc_id: min(1.0, score / max_possible) for doc_id, score in fused.items()
+    }
+
+    # Sort by fused (RRF) score, best first
+    ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+
+    if not ranked:
+        return SearchResult(
+            success=True,
+            query=query,
+            results=[],
+            total_found=0,
+            filtered_by={"slugs": slugs, "source_type": source_type},
+        )
+
+    # Fetch full document content
     db_results = []
     try:
         with sqlite3.connect(str(config.metadata_db_path)) as conn:
-            for r in results:
-                doc_id = r["doc_id"]
+            for doc_id, score in ranked:
                 doc = get_document_by_id(conn, doc_id)
                 if doc:
-                    # Apply filters
-                    if slugs and doc.get("slug") not in slugs:
-                        continue
-                    if source_type and doc.get("source_type") != source_type:
-                        continue
-                    
-                    db_results.append({**r, **doc})
-                    
-                    # Stop once we have enough filtered results
+                    db_results.append({"doc_id": doc_id, "score": score, **doc})
                     if len(db_results) >= top_k:
                         break
     except Exception as e:
         logger.warning("Failed to fetch document metadata: %s", e)
-        # Fallback to search results without full content
-        db_results = [{"doc_id": r["doc_id"], "score": r["score"]} for r in results[:top_k]]
-    
+        db_results = [{"doc_id": doc_id, "score": score} for doc_id, score in ranked[:top_k]]
+
     return SearchResult(
         success=True,
         query=query,
         results=db_results,
-        total_found=len(results),
+        total_found=len(ranked),
         filtered_by={"slugs": slugs, "source_type": source_type},
     )
 
