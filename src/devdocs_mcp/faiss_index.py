@@ -76,7 +76,8 @@ class EmbeddingIndex:
             self.model = SentenceTransformer(
                 EMBEDDING_MODEL,
                 cache_folder=str(model_cache_dir),
-                local_files_only=True
+                local_files_only=True,
+                token=False,
             )
             logger.debug("Loaded model from cache")
         except (OSError, ValueError):
@@ -85,7 +86,8 @@ class EmbeddingIndex:
             self.model = SentenceTransformer(
                 EMBEDDING_MODEL,
                 cache_folder=str(model_cache_dir),
-                local_files_only=False
+                local_files_only=False,
+                token=False,
             )
             logger.info("Model downloaded and cached")
         
