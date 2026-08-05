@@ -15,9 +15,35 @@ from typing import Any, Callable, Optional
 from lxml import html as lxml_html
 from lxml import etree
 
+import html2text
+
 from .chunking import chunk_document
 
 logger = logging.getLogger(__name__)
+
+
+def _make_html2text_converter() -> html2text.HTML2Text:
+    """Build an HTML2Text converter configured for documentation content.
+
+    Disables line-wrapping (body_width=0) so Markdown output isn't
+    hard-wrapped mid-sentence -- chunking/embedding work on logical lines,
+    not a fixed terminal width. unicode_snob keeps literal Unicode
+    characters (e.g. arrows, smart quotes) instead of html2text's default
+    ASCII-escaping, since we want faithful text for embedding/search
+    rather than a terminal-safe rendering.
+    """
+    converter = html2text.HTML2Text()
+    converter.body_width = 0
+    converter.unicode_snob = True
+    return converter
+
+
+# _clean_html() is called once per page/entry (potentially thousands of
+# times for large docsets), so the HTML2Text converter is built once and
+# reused rather than re-instantiated on every call. HTML2Text instances
+# are safely reusable across handle() calls -- internal state is reset
+# each time via HTMLParser.reset()/HTML2Text.__init__ conventions.
+_HTML2TEXT_CONVERTER = _make_html2text_converter()
 
 
 @dataclass
@@ -425,10 +451,14 @@ def extract_text_from_local(
 
 
 def _clean_html(tree: Any) -> str:
-    """Strip HTML tags and extract plain text from documentation pages.
+    """Strip HTML noise and convert documentation pages to Markdown text.
     
-    Uses lxml for fast HTML parsing. Prioritizes <main> content
-    if available to exclude navigation, headers, footers, and sidebars.
+    Uses lxml for fast HTML parsing to locate and prune the relevant
+    content (prioritizing <main> content if available, and removing
+    navigation, headers, footers, and sidebars), then hands the
+    remaining markup to html2text so headings, lists, links, emphasis,
+    and code blocks survive as Markdown instead of being flattened into
+    unstructured plain text.
     
     Args:
         tree: lxml element tree
@@ -480,12 +510,32 @@ def _clean_html(tree: Any) -> str:
             if parent is not None:
                 parent.remove(element)
     
-    # Extract text
-    text = content_element.text_content()
+    # Convert the cleaned markup to Markdown, preserving headings, lists,
+    # links, emphasis, and code blocks instead of flattening to plain text.
+    # with_tail=False: content_element may be an anchor-extracted fragment
+    # (e.g. via get_element_by_id), not just a whole-page container -- its
+    # .tail is unrelated sibling text that follows it in the DOM and must
+    # not leak into this element's own extracted content.
+    inner_html = etree.tostring(
+        content_element, encoding="unicode", method="html", with_tail=False
+    )
+    text = _HTML2TEXT_CONVERTER.handle(inner_html)
     
-    # Normalize whitespace
-    lines = [line.strip() for line in text.splitlines()]
-    text = '\n'.join(line for line in lines if line)
+    # Normalize whitespace: collapse blank-line runs left behind by
+    # html2text's block-element spacing, and strip leading/trailing
+    # whitespace from each line.
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned_lines: list[str] = []
+    blank_run = False
+    for line in lines:
+        if line.strip() == "":
+            if not blank_run:
+                cleaned_lines.append("")
+            blank_run = True
+        else:
+            cleaned_lines.append(line)
+            blank_run = False
+    text = "\n".join(cleaned_lines).strip()
     
     return text
 
